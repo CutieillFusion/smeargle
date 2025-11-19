@@ -1,0 +1,21 @@
+[project]
+name = "eagle"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch==2.6.0",
+    "transformers>=4.53.1",
+    "accelerate==0.26.0",
+    "fschat==0.2.31",
+    "gradio==3.50.2",
+    "openai==0.28.0",
+    "anthropic==0.5.0",
+    "sentencepiece==0.2.1",
+    "protobuf==3.19.0",
+    "wandb",
+    "deepspeed>=0.14.5",
+    "huggingface-hub>=0.35.3",
+    "datasets>=4.4.1",
+]

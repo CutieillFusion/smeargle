@@ -1,0 +1,30 @@
+# Containers
+containers/*
+
+*.sif
+*.err
+*.out
+*.jsonl
+*.pyc
+*.pt
+*.bin
+*.safetensors
+*.log
+__pycache__
+.venv
+
+# Checkpoints
+latest
+zero_to_fp32.py
+
+# Datasets
+datasets/*
+!datasets/pyproject.toml
+!datasets/download_datasets.py
+!datasets/uv.lock
+
+# Models
+models/*
+!models/pyproject.toml
+!models/download_hf_model.py
+!models/uv.lock
