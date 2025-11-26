@@ -1,5 +1,5 @@
 [project]
-name = "smeargle"
+name = "train-smeargle"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -19,4 +19,5 @@ dependencies = [
     "huggingface-hub>=0.35.3",
     "datasets>=4.4.1",
     "mamba-ssm[causal-conv1d]==2.2.5",
+    "black>=25.11.0",
 ]

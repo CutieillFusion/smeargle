@@ -17,7 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" PyTorch LLaMA model."""
+"""PyTorch LLaMA model."""
 import math
 from typing import List, Optional, Tuple, Union
 from collections import Counter
@@ -34,285 +34,77 @@ from configs import EConfig
 from safetensors import safe_open
 from datasets import load_dataset
 import multiprocessing
-from mamba_block import MambaBlock
-
-# Copied from transformers.models.bart.modeling_bart._make_causal_mask
-def _make_causal_mask(
-        input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
-):
-    """
-    Make causal mask used for bi-directional self-attention.
-    """
-    bsz, tgt_len = input_ids_shape
-    mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
-    mask_cond = torch.arange(mask.size(-1), device=device)
-    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-    mask = mask.to(dtype)
-
-    if past_key_values_length > 0:
-        mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
-    return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
+from mamba_ssm import Mamba2
 
 
-# Copied from transformers.models.bart.modeling_bart._expand_mask
-def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
-    """
-    Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
-    """
-    bsz, src_len = mask.size()
-    tgt_len = tgt_len if tgt_len is not None else src_len
-
-    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
-
-    inverted_mask = 1.0 - expanded_mask
-
-    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
-    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
-    cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
-    sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
-    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-class LlamaRotaryEmbedding(torch.nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
-        super().__init__()
-
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        # Build here to make `torch.jit.trace` work.
-        self._set_cos_sin_cache(
-            seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
-        )
-
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
-
-    def forward(self, x, seq_len=None):
-        # x: [bs, num_attention_heads, seq_len, head_size]
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
-
-        return (
-            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
-            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
-        )
-
-
-class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
-    """LlamaRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
-
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
-        self.scaling_factor = scaling_factor
-        super().__init__(dim, max_position_embeddings, base, device)
-
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-        t = t / self.scaling_factor
-
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
-
-
-class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
-    """LlamaRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
-
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
-        self.scaling_factor = scaling_factor
-        super().__init__(dim, max_position_embeddings, base, device)
-
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-
-        if seq_len > self.max_position_embeddings:
-            base = self.base * (
-                    (self.scaling_factor * seq_len / self.max_position_embeddings) - (self.scaling_factor - 1)
-            ) ** (self.dim / (self.dim - 2))
-            inv_freq = 1.0 / (base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
-            self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
-
-
-
-class LlamaAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+class MambaBlock(nn.Module):
+    """MAMBA block replacing attention mechanism using official Mamba2 implementation."""
 
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
-        self.q_proj = nn.Linear(self.hidden_size * 2, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-        self._init_rope()
+        # Input dimension is hidden_size * 2 (concatenated input_emb and hidden_states)
+        d_model = config.hidden_size * 2
 
-    def _init_rope(self):
-        if self.config.rope_scaling is None:
-            self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
-        else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
-            if scaling_type == "linear":
-                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
-                    self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
-                )
-            elif scaling_type == "dynamic":
-                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
-                    self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
-                )
-            else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+        # Get Mamba2 parameters from config with defaults
+        d_state = config.ssm_state_size
+        d_conv = config.ssm_conv_kernel
+        expand = config.ssm_expand
 
-    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        # Initialize official Mamba2 block
+        # Note: Mamba2 combines token mixing, SSM, and channel mixing internally
+        self.mamba2 = Mamba2(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+
+        # Output projection: (hidden_size * 2) -> hidden_size
+        self.out_proj = nn.Linear(d_model, config.hidden_size, bias=False)
+
+        # Store d_state for state caching compatibility
+        self.d_state = d_state
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            cache_hidden: Optional[List[torch.Tensor]] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_value: Optional[Tuple[torch.Tensor]] = None,
-            output_attentions: bool = False,
-            use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
+        self,
+        hidden_states: torch.Tensor,
+        cache_state: Optional[torch.Tensor] = None,
+        use_cache: bool = True,  # Controls state caching
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Forward pass of MAMBA block.
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        Args:
+            hidden_states: (batch, seq_len, hidden_size * 2) - concatenated input_emb and hidden_states
+            cache_state: (batch, d_state) or None - previous SSM state (currently not used by Mamba2)
+            use_cache: Whether to return updated state
 
-        lck = len(cache_hidden[0])
+        Returns:
+            output: (batch, seq_len, hidden_size)
+            cache_state: (batch, d_state) or None
+        """
+        # Forward pass through Mamba2
+        # Mamba2 internally handles token mixing, SSM, and channel mixing
+        # Note: cache_state parameter is ignored as Mamba2 manages state internally
+        x = self.mamba2(hidden_states)
 
-        # cache_k = [self.k_proj(hidden) for hidden in cache_hidden]
-        # cache_v = [self.v_proj(hidden) for hidden in cache_hidden]
+        # Output projection: (hidden_size * 2) -> hidden_size
+        output = self.out_proj(x)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-
-        cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
-        cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-        # query_states = apply_rotary_pos_emb(query_states, cos, sin, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids + lck)
-
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        # Avoid modify hidden cache inplace which will cause in-place modification error when enable gradient checkpoint. 
-        # Return the updated hidden cache instead.
-        if cache_hidden is None:
-            local_cache_k = []
-            local_cache_v = []
+        # Note: The official Mamba2 manages state internally and doesn't expose
+        # it in the same way as the custom implementation. For compatibility with
+        # the existing interface, we return None for state. If state caching is
+        # required, Mamba2's internal state management should be sufficient for
+        # sequential processing within a single forward pass.
+        if use_cache:
+            # Return None as Mamba2 handles state internally
+            # The caller should not rely on this state for cross-forward-pass caching
+            return output, None
         else:
-            local_cache_k = list(cache_hidden[0])
-            local_cache_v = list(cache_hidden[1])
-
-        local_cache_k.append(key_states)
-        local_cache_v.append(value_states)
-            
-        cache_k = local_cache_k
-        cache_v = local_cache_v
-
-        k0 = cache_k[0]
-        v0 = cache_v[0]
-
-        attn_weights = torch.matmul(query_states, k0.transpose(2, 3)) / math.sqrt(self.head_dim)
-        lck = len(cache_k)
-
-
-        attn_weights = attn_weights + attention_mask
-
-        for i in range(1, lck):
-            ki = cache_k[i]
-
-            qi = query_states
-            kiq = ki
-
-            attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
-            attn_weights = torch.cat((attn_weights, attn_weightsi[..., None]), dim=-1)
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights0 = attn_weights[..., :q_len]
-
-        attn_output = torch.matmul(attn_weights0, v0)
-
-        for i in range(1, lck):
-            vi = cache_v[i]
-            attn_weightsi = attn_weights[..., q_len + i - 1]
-            attn_outputi = attn_weightsi[..., None] * vi
-            attn_output = attn_output + attn_outputi
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
-        attn_output = self.o_proj(attn_output)
-
-        # Return the updated hidden cache.
-        new_past_key_value = [local_cache_k,local_cache_v]
-        return attn_output, new_past_key_value
+            return output, None
 
 
 class LlamaMLP(nn.Module):
@@ -338,13 +130,24 @@ class LlamaMLP(nn.Module):
             down_proj_slices = self.down_proj.weight.split(slice, dim=1)
 
             gate_proj = torch.cat(
-                [F.linear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1
+                [
+                    F.linear(x, gate_proj_slices[i])
+                    for i in range(self.config.pretraining_tp)
+                ],
+                dim=-1,
             )
-            up_proj = torch.cat([F.linear(x, up_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1)
+            up_proj = torch.cat(
+                [
+                    F.linear(x, up_proj_slices[i])
+                    for i in range(self.config.pretraining_tp)
+                ],
+                dim=-1,
+            )
 
             intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
             down_proj = [
-                F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(self.config.pretraining_tp)
+                F.linear(intermediate_states[i], down_proj_slices[i])
+                for i in range(self.config.pretraining_tp)
             ]
             down_proj = sum(down_proj)
         else:
@@ -383,30 +186,22 @@ class LlamaDecoderLayeremb(nn.Module):
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # if self.index!=0:
 
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
-            self,
-            input_emb: torch.Tensor,
-            hidden_states: torch.Tensor,
-            cache_state: Optional[torch.Tensor] = None,  # Changed from cache_hidden
-            cache_hidden: Optional[List[torch.Tensor]] = None,  # Kept for backward compatibility but ignored
-            attention_mask: Optional[torch.Tensor] = None,  # Ignored for MAMBA but kept for compatibility
-            position_ids: Optional[torch.LongTensor] = None,  # Ignored for MAMBA but kept for compatibility
-            past_key_value: Optional[Tuple[torch.Tensor]] = None,  # Ignored for MAMBA but kept for compatibility
-            output_attentions: Optional[bool] = False,  # Always False for MAMBA
-            use_cache: Optional[bool] = False,
+        self,
+        input_emb: torch.Tensor,
+        hidden_states: torch.Tensor,
+        cache_state: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = False,
     ) -> Tuple[torch.FloatTensor, Optional[torch.Tensor]]:
         """
         Args:
             input_emb: Input embeddings (batch, seq_len, hidden_size)
             hidden_states: Hidden states from target model (batch, seq_len, hidden_size)
             cache_state: Previous MAMBA state (batch, d_state) or None
-            cache_hidden: Legacy KV cache (ignored, kept for compatibility)
-            attention_mask: Ignored for MAMBA (kept for compatibility)
-            position_ids: Ignored for MAMBA (kept for compatibility)
-            past_key_value: Ignored for MAMBA (kept for compatibility)
-            output_attentions: Always False for MAMBA
             use_cache: Whether to return updated state
         """
 
@@ -416,7 +211,9 @@ class LlamaDecoderLayeremb(nn.Module):
         input_emb = self.input_layernorm(input_emb)
 
         # Concatenate input_emb and hidden_states for MAMBA block
-        hidden_states = torch.cat((input_emb, hidden_states), dim=-1)  # (batch, seq_len, hidden_size * 2)
+        hidden_states = torch.cat(
+            (input_emb, hidden_states), dim=-1
+        )  # (batch, seq_len, hidden_size * 2)
 
         return_hidden = hidden_states
 
@@ -424,14 +221,9 @@ class LlamaDecoderLayeremb(nn.Module):
         hidden_states, updated_state = self.mamba_block(
             hidden_states=hidden_states,
             cache_state=cache_state,
-            attention_mask=attention_mask,  # Ignored but passed for compatibility
-            position_ids=position_ids,  # Ignored but passed for compatibility
-            past_key_value=past_key_value,  # Ignored but passed for compatibility
-            output_attentions=output_attentions,
             use_cache=use_cache,
         )
         hidden_states = residual + hidden_states
-
 
         residual = hidden_states
 
@@ -440,7 +232,6 @@ class LlamaDecoderLayeremb(nn.Module):
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states, return_hidden)
-
 
         return outputs, updated_state
 
@@ -461,7 +252,7 @@ def process_data(data_chunk):
     input_ids = data_chunk["input_ids"]
     loss_mask = data_chunk["loss_mask"]
     for i in range(len(input_ids)):
-        ids= input_ids[i][0]
+        ids = input_ids[i][0]
         mask = loss_mask[i][0]
         for j in range(len(ids)):
             if mask[j] == 1:
@@ -479,17 +270,25 @@ def merge_dicts(dicts):
 
 
 class Model(nn.Module):
-    def __init__(self, config, ds_config, training_config, load_head=False, load_emb=True, path=None):
-        super().__init__() 
+    def __init__(
+        self,
+        config,
+        ds_config,
+        training_config,
+        load_head=False,
+        load_emb=True,
+        path=None,
+    ):
+        super().__init__()
         # self.layers = nn.ModuleList(
         #     [LlamaDecoderLayer(config, index=index) for index in range(config.num_hidden_layers)])
         self.train_config = training_config
-        print(self.train_config)
         # Settng dschf to allow efficient ZeRO-3 usage between hf and ds.
         if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
             dschf = HfDeepSpeedConfig(ds_config)
         else:
             dschf = None
+
         self.midlayer = LlamaDecoderLayeremb(config)
         self.gradient_checkpointing = self.train_config["gradient_checkpoint"]
         self.padding_idx = config.pad_token_id
@@ -497,27 +296,30 @@ class Model(nn.Module):
         self.hidden_size = config.hidden_size
         self.draft_vocab_size = config.draft_vocab_size
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.length = 20
+        self.length = 7
         # Lazy load target_model to avoid OOM before DeepSpeed initialization
         self._target_model = None
         self._target_model_path = path
-        self.fc=nn.Linear(self.hidden_size*3, self.hidden_size, bias=False)
+        self.fc = nn.Linear(self.hidden_size * 3, self.hidden_size, bias=False)
 
         if not load_emb:
-            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+            self.embed_tokens = nn.Embedding(
+                config.vocab_size, config.hidden_size, self.padding_idx
+            )
 
         else:
 
             from safetensors import safe_open
             import json
             import os
+
             try:
                 with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
                     index_json = json.loads(f.read())
                     emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                with safe_open(os.path.join(path, emb_path),
-                               framework="pt",
-                               device="cpu") as f:
+                with safe_open(
+                    os.path.join(path, emb_path), framework="pt", device="cpu"
+                ) as f:
                     tensor_slice = f.get_slice("model.embed_tokens.weight")
                     vocab_size, hidden_dim = tensor_slice.get_shape()
                     tensor = tensor_slice[:, :hidden_dim].float()
@@ -527,9 +329,13 @@ class Model(nn.Module):
                     emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
                 weights = torch.load(os.path.join(path, emb_path))
                 tensor = weights["model.embed_tokens.weight"].float()
-            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, _weight=tensor)
+            self.embed_tokens = nn.Embedding(
+                config.vocab_size, config.hidden_size, self.padding_idx, _weight=tensor
+            )
 
-        self.lm_head = nn.Linear(config.hidden_size, config.draft_vocab_size, bias=False)
+        self.lm_head = nn.Linear(
+            config.hidden_size, config.draft_vocab_size, bias=False
+        )
 
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
@@ -539,13 +345,12 @@ class Model(nn.Module):
         """Lazy load target model on first access to avoid OOM before DeepSpeed init"""
         if self._target_model is None:
             import os
+
             # Try to get local rank from environment to load only on one process if possible
             # But still load on all ranks since target_model is used during forward pass
             # Use low_cpu_mem_usage to minimize memory footprint
             self._target_model = LlamaForCausalLM.from_pretrained(
-                self._target_model_path, 
-                dtype=torch.float16,
-                low_cpu_mem_usage=True
+                self._target_model_path, dtype=torch.float16, low_cpu_mem_usage=True
             )
             self._target_model.eval()
             for param in self._target_model.parameters():
@@ -556,27 +361,28 @@ class Model(nn.Module):
         N = self.draft_vocab_size
         if not os.path.exists("cache.pt"):
             tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
-            dataset = load_dataset('json', data_files=datapath)
-            dataset = dataset['train']
+            dataset = load_dataset("json", data_files=datapath)
+            dataset = dataset["train"]
             # dataset = dataset.select(range(96))
             original_columns1 = dataset.column_names
             num_proc = 48
-
 
             def preprocess_function(examples):
                 new_examples = {
                     # "conversation": [],
                     "input_ids": [],
-                    "loss_mask": []
+                    "loss_mask": [],
                 }
-                for i in range(len(examples['id'])):
+                for i in range(len(examples["id"])):
                     messages = [
-                        {"role": "system",
-                         "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
+                        {
+                            "role": "system",
+                            "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.",
+                        },
                     ]
                     convroles = ["user", "assistant"]
                     roles = {"human": "user", "gpt": "assistant"}
-                    source = examples['conversations'][i]
+                    source = examples["conversations"][i]
                     if not source:
                         continue
                     if roles[source[0]["from"]] != "user":
@@ -587,9 +393,7 @@ class Model(nn.Module):
                         assert role == convroles[j % 2], f"{i}"
                         # if sentence["from"]=="gpt":
                         #     sentence["value"]=" "+sentence["value"]
-                        messages.append(
-                            {"role": role, "content": sentence["value"]}
-                        )
+                        messages.append({"role": role, "content": sentence["value"]})
                     conversation = tokenizer.apply_chat_template(
                         messages,
                         tokenize=False,
@@ -604,7 +408,7 @@ class Model(nn.Module):
                         return_tensors="pt",
                         add_special_tokens=False,
                     ).input_ids[0]
-                    # When construct draft model vocab, 
+                    # When construct draft model vocab,
                     # filter out samples which is longer than max_len,
                     # instead of truncating them.
                     if len(input_ids) > self.train_config["max_len"]:
@@ -638,9 +442,9 @@ class Model(nn.Module):
 
                         # Ignore the user instructions
                         if i == 0:
-                            loss_mask[cur_len: cur_len + instruction_len - 2] = 0
+                            loss_mask[cur_len : cur_len + instruction_len - 2] = 0
                         else:
-                            loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
+                            loss_mask[cur_len - 3 : cur_len + instruction_len + 1] = 0
                         cur_len += turn_len
                         if i != 0:
                             cur_len += 3
@@ -663,15 +467,17 @@ class Model(nn.Module):
                 batched=True,
                 num_proc=num_proc,
                 remove_columns=original_columns1,
-                load_from_cache_file=False
+                load_from_cache_file=False,
             )
-            #dataset.set_format(type="torch")
-
-
+            # dataset.set_format(type="torch")
 
             num_processes = num_proc
-            chunk_size = len(dataset) // num_processes + (len(dataset) % num_processes > 0)
-            chunks = [dataset[i:i + chunk_size] for i in range(0, len(dataset), chunk_size)]
+            chunk_size = len(dataset) // num_processes + (
+                len(dataset) % num_processes > 0
+            )
+            chunks = [
+                dataset[i : i + chunk_size] for i in range(0, len(dataset), chunk_size)
+            ]
 
             # 创建进程池
             with multiprocessing.Pool(num_processes) as pool:
@@ -680,7 +486,6 @@ class Model(nn.Module):
 
             # 合并结果
             token_dict = merge_dicts(results)
-
 
             total_frequency = sum(token_dict.values())
             top_N = token_dict.most_common(N)
@@ -693,13 +498,10 @@ class Model(nn.Module):
             t2d = [i in used_tokens for i in range(self.vocab_size)]
             d2t = torch.tensor(d2t)
             t2d = torch.tensor(t2d)
-            cache = {
-                "d2t": d2t,
-                "t2d": t2d
-            }
+            cache = {"d2t": d2t, "t2d": t2d}
             torch.save(cache, "cache.pt")
         else:
-            cache = torch.load("cache.pt")
+            cache = torch.load("cache.pt", weights_only=False)
             d2t = cache["d2t"]
             t2d = cache["t2d"]
         self.register_buffer("d2t", d2t)
@@ -707,38 +509,21 @@ class Model(nn.Module):
         # Update draft_vocab_size to match actual computed size and fix lm_head if needed
         actual_draft_vocab_size = int(t2d.sum().item())
         if actual_draft_vocab_size != self.draft_vocab_size:
-            print(f"Warning: config draft_vocab_size ({self.draft_vocab_size}) != actual ({actual_draft_vocab_size}). Updating lm_head...")
+            print(
+                f"Warning: config draft_vocab_size ({self.draft_vocab_size}) != actual ({actual_draft_vocab_size}). Updating lm_head..."
+            )
             self.draft_vocab_size = actual_draft_vocab_size
             # Recreate lm_head with correct size
             old_lm_head = self.lm_head
-            self.lm_head = nn.Linear(old_lm_head.in_features, actual_draft_vocab_size, bias=False)
+            self.lm_head = nn.Linear(
+                old_lm_head.in_features, actual_draft_vocab_size, bias=False
+            )
             # Initialize with existing weights if possible (first actual_draft_vocab_size outputs)
             if old_lm_head.weight.shape[0] >= actual_draft_vocab_size:
-                self.lm_head.weight.data = old_lm_head.weight.data[:actual_draft_vocab_size].clone()
+                self.lm_head.weight.data = old_lm_head.weight.data[
+                    :actual_draft_vocab_size
+                ].clone()
         self.l1smooth = nn.SmoothL1Loss(reduction="none")
-
-    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
-        # create causal mask
-        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-        combined_attention_mask = None
-        if input_shape[-1] > 1:
-            combined_attention_mask = _make_causal_mask(
-                input_shape,
-                inputs_embeds.dtype,
-                device=inputs_embeds.device,
-                past_key_values_length=past_key_values_length,
-            )
-
-        if attention_mask is not None:
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]).to(
-                inputs_embeds.device
-            )
-            combined_attention_mask = (
-                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
-            )
-
-        return combined_attention_mask
 
     @torch.no_grad()
     def dataprepare(self, input_ids, attention_mask, loss_mask):
@@ -753,7 +538,9 @@ class Model(nn.Module):
         hidden_states0 = outs.hidden_states[0]
         hidden_states1 = outs.hidden_states[1]
         hidden_states2 = outs.hidden_states[2]
-        hidden_states=torch.cat((hidden_states0,hidden_states1,hidden_states2),dim=-1)
+        hidden_states = torch.cat(
+            (hidden_states0, hidden_states1, hidden_states2), dim=-1
+        )
         # hidden_states=torch.cat((hidden_states0,hidden_states1),dim=-1)
         target = outs.logits
         target = padding(target, left=False)
@@ -767,24 +554,30 @@ class Model(nn.Module):
         return hidden_states, target, loss_mask, input_ids
 
     def forward(
-            self,
-            # hidden_states,
-            input_ids,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            loss_mask: Optional[torch.Tensor] = None,
+        self,
+        # hidden_states,
+        input_ids,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        loss_mask: Optional[torch.Tensor] = None,
     ):
-        hidden_states, target, loss_mask, input_ids = self.dataprepare(input_ids, attention_mask, loss_mask)
+        hidden_states, target, loss_mask, input_ids = self.dataprepare(
+            input_ids, attention_mask, loss_mask
+        )
 
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
-        if self.training and self.gradient_checkpointing and not hidden_states.requires_grad:
+        if (
+            self.training
+            and self.gradient_checkpointing
+            and not hidden_states.requires_grad
+        ):
             hidden_states.requires_grad = True
 
         hidden_states = self.fc(hidden_states)
@@ -795,26 +588,32 @@ class Model(nn.Module):
         if position_ids is None:
             device = hidden_states.device
             position_ids = torch.arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+                past_key_values_length,
+                seq_length + past_key_values_length,
+                dtype=torch.long,
+                device=device,
             )
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 
+        # Note: attention_mask is not used by MambaBlock, but kept for API compatibility
         if attention_mask is None:
             attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
+                (batch_size, seq_length_with_past),
+                dtype=torch.bool,
+                device=hidden_states.device,
             )
-        attention_mask = self._prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), hidden_states, past_key_values_length
-        )
 
         if self.gradient_checkpointing and self.training and use_cache:
             use_cache = False
 
-        cache_hidden = [[], []] # Initialize cache_hidden as list of two empty lists (cache_k, cache_v)
-        plosses = [] # Initialize plosses list
-        acces = [] # Initialize acces list
+        cache_hidden = [
+            [],
+            [],
+        ]  # Initialize cache_hidden as list of two empty lists (cache_k, cache_v)
+        plosses = []  # Initialize plosses list
+        acces = []  # Initialize acces list
         for idx in range(self.length):
             last = idx == self.length - 1
             inputs_embeds = self.embed_tokens(input_ids)
@@ -823,11 +622,7 @@ class Model(nn.Module):
             layer_outputs, cache_hidden = self.midlayer(
                 input_emb=inputs_embeds,
                 hidden_states=hidden_states,
-                cache_hidden=cache_hidden,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=None,
-                output_attentions=output_attentions,
+                cache_state=cache_hidden,
                 use_cache=True,
             )
 
@@ -836,15 +631,15 @@ class Model(nn.Module):
             hidden_states_out = self.norm(hidden_states_out)
             logits = self.lm_head(hidden_states_out)
             logits = logits.float()
-            
+
             # Check logits for NaN/Inf before LogSoftmax
             if not torch.isfinite(logits).all():
                 nan_count = (~torch.isfinite(logits)).sum().item()
                 total_count = logits.numel()
-                if os.environ.get("DEBUG_OVERFLOW", "false").lower() == "true":
-                    print(f"[DEBUG] Position {idx}: logits has {nan_count}/{total_count} NaN/Inf values")
                 # Replace NaN/Inf with zeros to prevent propagation
-                logits = torch.where(torch.isfinite(logits), logits, torch.zeros_like(logits))
+                logits = torch.where(
+                    torch.isfinite(logits), logits, torch.zeros_like(logits)
+                )
 
             with torch.no_grad():
                 # hidden_states_target = padding(hidden_states, left=False)
@@ -860,40 +655,41 @@ class Model(nn.Module):
                 target_p = nn.Softmax(dim=2)(target_head)
 
             out_logp = nn.LogSoftmax(dim=2)(logits)
-            
+
             # Check out_logp for NaN/Inf after LogSoftmax
             if not torch.isfinite(out_logp).all():
                 nan_count = (~torch.isfinite(out_logp)).sum().item()
                 total_count = out_logp.numel()
-                if os.environ.get("DEBUG_OVERFLOW", "false").lower() == "true":
-                    print(f"[DEBUG] Position {idx}: out_logp has {nan_count}/{total_count} NaN/Inf values")
                 # Replace NaN/Inf with a large negative value (log(0) approximation)
-                out_logp = torch.where(torch.isfinite(out_logp), out_logp, torch.full_like(out_logp, -1e6))
-            
+                out_logp = torch.where(
+                    torch.isfinite(out_logp), out_logp, torch.full_like(out_logp, -1e6)
+                )
+
             plogp = target_p * out_logp
             loss = -torch.sum(position_mask * plogp, 2).mean()
             sum_logit = torch.sum(position_mask * plogp, 2)
             loss = -sum_logit.mean()
-            
+
             # Check loss for NaN/Inf before appending
             if not torch.isfinite(loss):
-                if os.environ.get("DEBUG_OVERFLOW", "false").lower() == "true":
-                    print(f"[WARNING] Position {idx}: loss is NaN/Inf: {loss.item()}, replacing with 0.0")
                 # Replace with zero to prevent propagation
-                loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype, requires_grad=True)
-            
+                loss = torch.tensor(
+                    0.0, device=loss.device, dtype=loss.dtype, requires_grad=True
+                )
+
             plosses.append(loss)
 
-            acces.append(((logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)).sum().item() / (loss_mask.sum().item() + 1e-6))
+            acces.append(
+                ((logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1))
+                .sum()
+                .item()
+                / (loss_mask.sum().item() + 1e-6)
+            )
 
             if not last:
                 input_ids = padding(input_ids, left=False)
                 target = padding(target, left=False)
-                seq_length = attention_mask.shape[-1]
+                # seq_length remains the same for the next iteration
                 loss_mask = padding(loss_mask, left=False)
 
         return plosses, acces
-
-
-
-
