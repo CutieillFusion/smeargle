@@ -12,6 +12,18 @@ parser.add_argument(
     default=-1,
     help="local_rank for distributed training on gpus",
 )
+parser.add_argument(
+    "--patience",
+    type=int,
+    default=1,
+    help="Early stopping patience based on best test pLoss at position 0. None means no early stopping.",
+)
+parser.add_argument(
+    "--epochs",
+    type=int,
+    default=40,
+    help="Number of epochs to train",
+)
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -24,7 +36,7 @@ with open(deepspeed_config) as f:
 
 train_config = {
     "bs": ds_config["train_micro_batch_size_per_gpu"],
-    "num_epochs": 40,
+    "num_epochs": args.epochs,
     "num_workers": 2,
     "max_len": 2048,
     "config_path": "config.json",
@@ -79,7 +91,6 @@ from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from tqdm import tqdm
 
-# import accelerate
 import numpy as np
 from transformers import PreTrainedTokenizerBase, get_linear_schedule_with_warmup
 
@@ -91,7 +102,7 @@ def build_dataset_rank(tokenizer, datapath):
     ds = ds.shuffle(seed=42)
     ds1 = ds
     original_columns1 = ds1.column_names
-    num_proc = 8
+    num_proc = 48
 
     def preprocess_function(examples):
         new_examples = {"attention_mask": [], "input_ids": [], "loss_mask": []}
@@ -105,17 +116,19 @@ def build_dataset_rank(tokenizer, datapath):
             convroles = ["user", "assistant"]
             roles = {"human": "user", "gpt": "assistant"}
             source = examples["conversations"][i]
+
             if not source:
                 continue
+
             if roles[source[0]["from"]] != "user":
                 # Skip the first one if it is not from human
                 source = source[1:]
+
             for j, sentence in enumerate(source):
                 role = roles[sentence["from"]]
                 assert role == convroles[j % 2], f"{i}"
-                # if sentence["from"]=="gpt":
-                #     sentence["value"]=" "+sentence["value"]
                 messages.append({"role": role, "content": sentence["value"]})
+
             conversation = tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
@@ -130,11 +143,12 @@ def build_dataset_rank(tokenizer, datapath):
                 return_tensors="pt",
                 add_special_tokens=False,
             ).input_ids[0]
+
             # filtering out the samples which is longer than max_len
             if len(input_ids) > train_config["max_len"]:
                 continue
+
             loss_mask = torch.ones_like(input_ids)
-            # print(i)
 
             sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
 
@@ -168,16 +182,10 @@ def build_dataset_rank(tokenizer, datapath):
                 cur_len += turn_len
                 if i != 0:
                     cur_len += 3
-                # cur_len+=2
-
-                # if i != 0 and not tokenizer.legacy:
-                #     # The legacy and non-legacy modes handle special tokens differently
-                #     cur_len -= 1
 
             loss_mask[cur_len:] = 0
             attention_mask = torch.ones_like(loss_mask)
 
-            # new_examples["conversation"].append(conversation)
             new_examples["input_ids"].append(input_ids[None, :])
             new_examples["loss_mask"].append(loss_mask[None, :])
             new_examples["attention_mask"].append(attention_mask[None, :])
@@ -200,7 +208,6 @@ class DataCollatorWithPadding:
 
     def paddingtensor(self, intensors, N):
         B, n, S = intensors.shape
-        # padding_tensor = torch.zeros(B, N - n, S,dtype=intensors.dtype)
         padding_tensor = torch.zeros(B, N - n, S, dtype=intensors.dtype)
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
@@ -242,8 +249,7 @@ config = EConfig.from_pretrained(train_config["config_path"])
 model = Model(
     config, ds_config, train_config, path=args.basepath, load_emb=True, load_head=True
 )
-model.scandata(args.trainpath, args.basepath)
-
+model.scandata(args.trainpath, args.basepath, args.local_rank)
 
 criterion = nn.SmoothL1Loss(reduction="none")
 
@@ -283,21 +289,6 @@ if not _fragment_address_registered and hasattr(model_engine, "checkpoint_engine
 global_rank = deepspeed.comm.get_rank()
 rank = deepspeed.comm.get_local_rank()
 world_size = deepspeed.comm.get_world_size()
-if global_rank == 0:
-    import wandb
-    import os
-
-    # Disable wandb by default (option 3 = "Don't visualize my results")
-    # Set WANDB_MODE=online in environment to enable tracking
-    wandb_mode = os.environ.get("WANDB_MODE", "disabled")
-
-    # Only login if wandb is enabled
-    if wandb_mode != "disabled":
-        wandb.login(key="")
-
-    wandb.init(
-        project="SMEARGLE", entity="dylan-norquist", config=ds_config, mode=wandb_mode
-    )
 
 args.savedir = f"models/{args.savedir}"
 
@@ -368,6 +359,11 @@ if checkpoint_path:
     model_engine.load_checkpoint(checkpoint_path, load_module_strict=False)
 
 
+# Initialize early stopping variables
+best_test_ploss_pos0 = float("inf")
+patience_counter = 0
+best_epoch = -1
+
 for epoch in range(start_epoch, num_epochs):
     train_sampler.set_epoch(epoch + 1)
     print(f"Now training epoch {epoch}")
@@ -376,155 +372,34 @@ for epoch in range(start_epoch, num_epochs):
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
 
-    # Debugging counters
-    skipped_batches = 0
-    nan_loss_count = 0
-
     for batch_idx, data in enumerate(tqdm(train_loader)):
-        try:
-            model.zero_grad()
 
-            device = next(model_engine.module.parameters()).device
+        model.zero_grad()
 
-            # Get loss scale before forward pass
-            if hasattr(model_engine, "optimizer") and hasattr(
-                model_engine.optimizer, "loss_scaler"
-            ):
-                current_loss_scale = model_engine.optimizer.loss_scaler.cur_scale
+        device = next(model_engine.module.parameters()).device
+        plosses, acces = model_engine(
+            input_ids=data["input_ids"].to(device),
+            attention_mask=data["attention_mask"].to(device),
+            loss_mask=data["loss_mask"].to(device),
+        )
 
-            plosses, acces = model_engine(
-                input_ids=data["input_ids"].to(device),
-                attention_mask=data["attention_mask"].to(device),
-                loss_mask=data["loss_mask"].to(device),
-            )
+        ploss_weight = [0.8**i for i in range(len(plosses))]
+        ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
+        loss = ploss
+        model_engine.backward(loss)
 
-            # Check for NaN/Inf in individual losses
-            valid_plosses = []
-            for i, ploss in enumerate(plosses):
-                if not torch.isfinite(ploss):
-                    if global_rank == 0:
-                        print(
-                            f"[WARNING] Batch {batch_idx}, Position {i}: Invalid loss (NaN/Inf): {ploss.item()}"
-                        )
-                    nan_loss_count += 1
-                    # Replace with zero to prevent propagation
-                    valid_plosses.append(
-                        torch.tensor(0.0, device=ploss.device, dtype=ploss.dtype)
-                    )
-                else:
-                    valid_plosses.append(ploss)
-            plosses = valid_plosses
+        model_engine.step()
 
-            ploss_weight = [0.8**i for i in range(len(plosses))]
-            ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
-            loss = ploss
-
-            # Check final loss for NaN/Inf before backward
-            if not torch.isfinite(loss):
-                if global_rank == 0:
-                    print(
-                        f"[ERROR] Batch {batch_idx}: Final loss is NaN/Inf: {loss.item()}, skipping batch"
-                    )
-                skipped_batches += 1
-                continue
-
-            # Scale down loss if it's too large to prevent gradient explosion
-            # Large losses can cause gradients to overflow even with loss scaling
-            max_loss_value = 100.0
-            loss_abs = loss.abs()
-            if loss_abs > max_loss_value:
-                if global_rank == 0 and batch_idx % 10 == 0:
-                    print(
-                        f"[WARNING] Batch {batch_idx}: Loss too large ({loss.item():.2f}), scaling down"
-                    )
-                loss = loss * (max_loss_value / loss_abs)
-
-            # Log loss scale periodically
-            if (
-                batch_idx % 10 == 0
-                and global_rank == 0
-                and hasattr(model_engine, "optimizer")
-                and hasattr(model_engine.optimizer, "loss_scaler")
-            ):
-                loss_scale = model_engine.optimizer.loss_scaler.cur_scale
-
-            model_engine.backward(loss)
-
-            # Try to step optimizer - this is where the loss scale exception is raised
-            try:
-                model_engine.step()
-            except Exception as step_e:
-                if "loss scale already at minimum" in str(step_e):
-                    if global_rank == 0:
-                        print(
-                            f"[ERROR] Batch {batch_idx}: Loss scale at minimum, attempting to recover..."
-                        )
-                    # Try to reset gradients and continue
-                    try:
-                        model_engine.optimizer.zero_grad()
-                    except:
-                        pass
-                    skipped_batches += 1
-                    # Don't re-raise, continue to next batch
-                    continue
-                else:
-                    # Re-raise other exceptions to be caught by outer handler
-                    raise
-
-        except Exception as e:
-            if global_rank == 0:
-                print(f"[ERROR] Batch {batch_idx}: Exception during training: {e}")
-                import traceback
-
-                traceback.print_exc()
-            skipped_batches += 1
-            # Try to reset gradients before continuing
-            try:
-                model_engine.optimizer.zero_grad()
-            except:
-                pass
-            # Continue to next batch instead of crashing
-            continue
-
-        if global_rank == 0:
-            logdict = {"train/lr": optimizer.optimizer.param_groups[0]["lr"]}
-            for i in range(len(plosses)):
-                logdict[f"train/ploss_{i}"] = plosses[i].item()
-            for i in range(len(acces)):
-                logdict[f"train/acc_{i}"] = acces[i]
-            # Add debugging metrics
-            if hasattr(model_engine, "optimizer") and hasattr(
-                model_engine.optimizer, "loss_scaler"
-            ):
-                logdict["train/loss_scale"] = (
-                    model_engine.optimizer.loss_scaler.cur_scale
-                )
-            logdict["train/skipped_batches"] = skipped_batches
-            logdict["train/nan_loss_count"] = nan_loss_count
-            wandb.log(logdict)
         epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
         epoch_plosses = [
             epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
         ]
-
-    # Log summary at end of epoch
-    if global_rank == 0:
-        print(
-            f"[SUMMARY] Epoch {epoch}: Skipped batches: {skipped_batches}, NaN losses: {nan_loss_count}"
-        )
-        if hasattr(model_engine, "optimizer") and hasattr(
-            model_engine.optimizer, "loss_scaler"
-        ):
-            print(
-                f"[SUMMARY] Final loss scale: {model_engine.optimizer.loss_scaler.cur_scale}"
-            )
 
     for i in range(len(epoch_acces)):
         acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
         deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
         acc_i = acc_i.item()
         if global_rank == 0:
-            wandb.log({f"train/epochacc_{i}": acc_i})
             print(
                 f"Train Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}"
             )
@@ -534,7 +409,6 @@ for epoch in range(start_epoch, num_epochs):
         deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
         loss_i = loss_i.item()
         if global_rank == 0:
-            wandb.log({f"train/epochploss_{i}": loss_i})
             print(
                 f"Train Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}"
             )
@@ -560,20 +434,50 @@ for epoch in range(start_epoch, num_epochs):
         deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
         acc_i = acc_i.item()
         if global_rank == 0:
-            wandb.log({f"test/epochacc_{i}": acc_i})
             print(
                 f"Test Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}"
             )
 
+    test_ploss_pos0 = None
     for i in range(len(epoch_plosses)):
         loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
         deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
         loss_i = loss_i.item()
+        if i == 0:
+            test_ploss_pos0 = loss_i
         if global_rank == 0:
-            wandb.log({f"test/epochploss_{i}": loss_i})
             print(
                 f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}"
             )
+
+    # Early stopping based on test pLoss at position 0
+    if args.patience is not None and test_ploss_pos0 is not None:
+        if test_ploss_pos0 < best_test_ploss_pos0:
+            best_test_ploss_pos0 = test_ploss_pos0
+            best_epoch = epoch
+            patience_counter = 0
+            if global_rank == 0:
+                print(
+                    f"New best test pLoss at position 0: {best_test_ploss_pos0:.4f} at epoch {epoch + 1}"
+                )
+                # Save best model
+                model_engine.save_16bit_model(
+                    f"{args.savedir}/best_model", exclude_frozen_parameters=True
+                )
+        else:
+            if global_rank == 0:
+                print(
+                    f"No improvement in test pLoss at position 0. Patience: {patience_counter}/{args.patience}"
+                )
+
+            if patience_counter >= args.patience:
+                if global_rank == 0:
+                    print(
+                        f"Early stopping triggered! Best test pLoss at position 0: {best_test_ploss_pos0:.4f} at epoch {best_epoch + 1}"
+                    )
+                break
+            patience_counter += 1
+
     # clear out the redundance cahce after each step
     torch.cuda.empty_cache()
 

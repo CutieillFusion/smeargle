@@ -2,20 +2,10 @@ import argparse
 import deepspeed
 
 parser = argparse.ArgumentParser(description="sp")
-parser.add_argument(
-    "--basepath", type=str, default="/home/lyh/weights/hf/llama31chat/8B/"
-)
-parser.add_argument(
-    "--trainpath",
-    type=str,
-    default="/home/lyh/code/nlp/developing/vllmbase/vllm/gedata/l318b.jsonl",
-)
-parser.add_argument(
-    "--testpath",
-    type=str,
-    default="/home/lyh/code/nlp/developing/vllmbase/vllm/gedata/0318.json",
-)
-parser.add_argument("--savedir", type=str, default="0")
+parser.add_argument("--basepath", type=str, required=True)
+parser.add_argument("--trainpath", type=str, required=True)
+parser.add_argument("--testpath", type=str, required=True)
+parser.add_argument("--savedir", type=str, required=True)
 parser.add_argument(
     "--local_rank",
     type=int,
@@ -28,17 +18,25 @@ parser.add_argument(
     default=1,
     help="Early stopping patience based on best test pLoss at position 0. None means no early stopping.",
 )
+parser.add_argument(
+    "--epochs",
+    type=int,
+    default=40,
+    help="Number of epochs to train",
+)
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
+
 import json
 import re
 
 deepspeed_config = args.deepspeed_config
 with open(deepspeed_config) as f:
     ds_config = json.load(f)
+
 train_config = {
     "bs": ds_config["train_micro_batch_size_per_gpu"],
-    "num_epochs": 40,
+    "num_epochs": args.epochs,
     "num_workers": 2,
     "max_len": 2048,
     "config_path": "config.json",
@@ -48,12 +46,9 @@ train_config = {
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import os
-
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 import torch
 from cnets import padding
 
-# Fix for PyTorch 2.6: Add DeepSpeed classes to safe globals for checkpoint loading
 try:
     from deepspeed.runtime.fp16.loss_scaler import DynamicLossScaler
     from deepspeed.runtime.zero.config import ZeroStageEnum
@@ -82,9 +77,6 @@ except (ImportError, AttributeError) as e:
     except (ImportError, AttributeError):
         pass  # fragment_address not available, may cause issues with checkpoint loading
 
-# Patch DeepSpeed's checkpoint engine to handle weights_only for PyTorch 2.6
-# This will be applied to the instance after deepspeed.initialize() if needed
-
 torch.backends.cuda.matmul.allow_tf32 = True
 from accelerate.utils import set_seed
 
@@ -99,7 +91,6 @@ from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from tqdm import tqdm
 
-# import accelerate
 import numpy as np
 from transformers import PreTrainedTokenizerBase, get_linear_schedule_with_warmup
 
@@ -111,7 +102,7 @@ def build_dataset_rank(tokenizer, datapath):
     ds = ds.shuffle(seed=42)
     ds1 = ds
     original_columns1 = ds1.column_names
-    num_proc = 8
+    num_proc = 48
 
     def preprocess_function(examples):
         new_examples = {"attention_mask": [], "input_ids": [], "loss_mask": []}
@@ -125,17 +116,19 @@ def build_dataset_rank(tokenizer, datapath):
             convroles = ["user", "assistant"]
             roles = {"human": "user", "gpt": "assistant"}
             source = examples["conversations"][i]
+
             if not source:
                 continue
+
             if roles[source[0]["from"]] != "user":
                 # Skip the first one if it is not from human
                 source = source[1:]
+
             for j, sentence in enumerate(source):
                 role = roles[sentence["from"]]
                 assert role == convroles[j % 2], f"{i}"
-                # if sentence["from"]=="gpt":
-                #     sentence["value"]=" "+sentence["value"]
                 messages.append({"role": role, "content": sentence["value"]})
+
             conversation = tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
@@ -150,11 +143,12 @@ def build_dataset_rank(tokenizer, datapath):
                 return_tensors="pt",
                 add_special_tokens=False,
             ).input_ids[0]
+
             # filtering out the samples which is longer than max_len
             if len(input_ids) > train_config["max_len"]:
                 continue
+
             loss_mask = torch.ones_like(input_ids)
-            # print(i)
 
             sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
 
@@ -188,16 +182,10 @@ def build_dataset_rank(tokenizer, datapath):
                 cur_len += turn_len
                 if i != 0:
                     cur_len += 3
-                # cur_len+=2
-
-                # if i != 0 and not tokenizer.legacy:
-                #     # The legacy and non-legacy modes handle special tokens differently
-                #     cur_len -= 1
 
             loss_mask[cur_len:] = 0
             attention_mask = torch.ones_like(loss_mask)
 
-            # new_examples["conversation"].append(conversation)
             new_examples["input_ids"].append(input_ids[None, :])
             new_examples["loss_mask"].append(loss_mask[None, :])
             new_examples["attention_mask"].append(attention_mask[None, :])
@@ -220,7 +208,6 @@ class DataCollatorWithPadding:
 
     def paddingtensor(self, intensors, N):
         B, n, S = intensors.shape
-        # padding_tensor = torch.zeros(B, N - n, S,dtype=intensors.dtype)
         padding_tensor = torch.zeros(B, N - n, S, dtype=intensors.dtype)
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
@@ -262,8 +249,7 @@ config = EConfig.from_pretrained(train_config["config_path"])
 model = Model(
     config, ds_config, train_config, path=args.basepath, load_emb=True, load_head=True
 )
-model.scandata(args.trainpath, args.basepath)
-
+model.scandata(args.trainpath, args.basepath, args.local_rank)
 
 criterion = nn.SmoothL1Loss(reduction="none")
 
@@ -303,21 +289,6 @@ if not _fragment_address_registered and hasattr(model_engine, "checkpoint_engine
 global_rank = deepspeed.comm.get_rank()
 rank = deepspeed.comm.get_local_rank()
 world_size = deepspeed.comm.get_world_size()
-if global_rank == 0:
-    import wandb
-    import os
-
-    # Disable wandb by default (option 3 = "Don't visualize my results")
-    # Set WANDB_MODE=online in environment to enable tracking
-    wandb_mode = os.environ.get("WANDB_MODE", "disabled")
-
-    # Only login if wandb is enabled
-    if wandb_mode != "disabled":
-        wandb.login(key="")
-
-    wandb.init(
-        project="SMEARGLE", entity="dylan-norquist", config=ds_config, mode=wandb_mode
-    )
 
 args.savedir = f"models/{args.savedir}"
 
@@ -419,13 +390,6 @@ for epoch in range(start_epoch, num_epochs):
 
         model_engine.step()
 
-        if global_rank == 0:
-            logdict = {"train/lr": optimizer.optimizer.param_groups[0]["lr"]}
-            for i in range(len(plosses)):
-                logdict[f"train/ploss_{i}"] = plosses[i].item()
-            for i in range(len(acces)):
-                logdict[f"train/acc_{i}"] = acces[i]
-            wandb.log(logdict)
         epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
         epoch_plosses = [
             epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
@@ -436,7 +400,6 @@ for epoch in range(start_epoch, num_epochs):
         deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
         acc_i = acc_i.item()
         if global_rank == 0:
-            wandb.log({f"train/epochacc_{i}": acc_i})
             print(
                 f"Train Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}"
             )
@@ -446,7 +409,6 @@ for epoch in range(start_epoch, num_epochs):
         deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
         loss_i = loss_i.item()
         if global_rank == 0:
-            wandb.log({f"train/epochploss_{i}": loss_i})
             print(
                 f"Train Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}"
             )
@@ -472,7 +434,6 @@ for epoch in range(start_epoch, num_epochs):
         deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
         acc_i = acc_i.item()
         if global_rank == 0:
-            wandb.log({f"test/epochacc_{i}": acc_i})
             print(
                 f"Test Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}"
             )
@@ -485,7 +446,6 @@ for epoch in range(start_epoch, num_epochs):
         if i == 0:
             test_ploss_pos0 = loss_i
         if global_rank == 0:
-            wandb.log({f"test/epochploss_{i}": loss_i})
             print(
                 f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}"
             )

@@ -14,7 +14,6 @@ dependencies = [
     "anthropic==0.5.0",
     "sentencepiece==0.2.1",
     "protobuf==3.19.0",
-    "wandb",
     "deepspeed>=0.14.5",
     "huggingface-hub>=0.35.3",
     "datasets>=4.4.1",

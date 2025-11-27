@@ -34,7 +34,7 @@ from configs import EConfig
 from safetensors import safe_open
 from datasets import load_dataset
 import multiprocessing
-
+import time
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -406,10 +406,7 @@ class LlamaMLP(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        # if last:
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        # else:
-        #     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size * 2, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
@@ -470,10 +467,8 @@ class LlamaDecoderLayeremb(nn.Module):
         self.self_attn = LlamaAttention(config=config)
         self.mlp = LlamaMLP(config, last=last)
         self.last = last
-        # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # if self.index!=0:
 
         self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -514,8 +509,6 @@ class LlamaDecoderLayeremb(nn.Module):
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
 
         return_hidden = hidden_states
-
-        # cache_hidden.append(hidden_states)
 
         # Self Attention
         hidden_states, latest_hidden_cache = self.self_attn(
@@ -566,7 +559,6 @@ def process_data(data_chunk):
 
 
 def merge_dicts(dicts):
-    """合并多个 Counter 字典"""
     result = Counter()
     for d in dicts:
         result.update(d)
@@ -584,8 +576,6 @@ class Model(nn.Module):
         path=None,
     ):
         super().__init__()
-        # self.layers = nn.ModuleList(
-        #     [LlamaDecoderLayer(config, index=index) for index in range(config.num_hidden_layers)])
         self.train_config = training_config
         # Settng dschf to allow efficient ZeRO-3 usage between hf and ds.
         if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
@@ -654,7 +644,7 @@ class Model(nn.Module):
             # Use low_cpu_mem_usage to minimize memory footprint
             self._target_model = LlamaForCausalLM.from_pretrained(
                 self._target_model_path,
-                torch_dtype=torch.float16,
+                dtype=torch.float16,
                 low_cpu_mem_usage=True,
             )
             self._target_model.eval()
@@ -662,9 +652,16 @@ class Model(nn.Module):
                 param.requires_grad = False
         return self._target_model
 
-    def scandata(self, datapath, tokenizerpath):
+    def scandata(self, datapath, tokenizerpath, local_rank):
         N = self.draft_vocab_size
-        if not os.path.exists("cache.pt"):
+
+        if local_rank != 0 and not os.path.exists("cache.pt"):
+            while not os.path.exists("cache.pt"):
+                time.sleep(1)
+            cache = torch.load("cache.pt")
+            d2t = cache["d2t"]
+            t2d = cache["t2d"]
+        elif local_rank == 0 and not os.path.exists("cache.pt"):
             tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
             dataset = load_dataset("json", data_files=datapath)
             dataset = dataset["train"]
@@ -775,7 +772,6 @@ class Model(nn.Module):
                 load_from_cache_file=False,
             )
             # dataset.set_format(type="torch")
-
             num_processes = num_proc
             chunk_size = len(dataset) // num_processes + (
                 len(dataset) % num_processes > 0
@@ -809,6 +805,7 @@ class Model(nn.Module):
             cache = torch.load("cache.pt")
             d2t = cache["d2t"]
             t2d = cache["t2d"]
+ 
         self.register_buffer("d2t", d2t)
         self.register_buffer("t2d", t2d)
         # Update draft_vocab_size to match actual computed size and fix lm_head if needed
@@ -887,7 +884,6 @@ class Model(nn.Module):
 
     def forward(
         self,
-        # hidden_states,
         input_ids,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -975,7 +971,6 @@ class Model(nn.Module):
             logits = logits.float()
 
             with torch.no_grad():
-                # hidden_states_target = padding(hidden_states, left=False)
                 target_head = target
                 target_max_token = target_head.argmax(-1)
                 # Move d2t to the same device as target_max_token
@@ -989,15 +984,16 @@ class Model(nn.Module):
 
             out_logp = nn.LogSoftmax(dim=2)(logits)
             plogp = target_p * out_logp
-            loss = -torch.sum(position_mask * plogp, 2).mean()
             sum_logit = torch.sum(position_mask * plogp, 2)
             loss = -sum_logit.mean()
             plosses.append(loss)
 
             acces.append(
                 ((logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1))
+                .cumprod(dim=1) 
+                * position_mask.squeeze(-1)
                 .sum()
-                .item()
+                .item() 
                 / (loss_mask.sum().item() + 1e-6)
             )
 

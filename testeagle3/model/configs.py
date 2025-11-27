@@ -1,5 +1,6 @@
 from transformers.configuration_utils import PretrainedConfig
 
+
 class EConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`LlamaModel`]. It is used to instantiate an LLaMA
@@ -72,6 +73,7 @@ class EConfig(PretrainedConfig):
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
+
     model_type = "llama"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -142,5 +144,11 @@ class EConfig(PretrainedConfig):
             raise ValueError(
                 f"`rope_scaling`'s name field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
             )
-        if rope_scaling_factor is None or not isinstance(rope_scaling_factor, float) or rope_scaling_factor <= 1.0:
-            raise ValueError(f"`rope_scaling`'s factor field must be an float > 1, got {rope_scaling_factor}")
+        if (
+            rope_scaling_factor is None
+            or not isinstance(rope_scaling_factor, float)
+            or rope_scaling_factor <= 1.0
+        ):
+            raise ValueError(
+                f"`rope_scaling`'s factor field must be an float > 1, got {rope_scaling_factor}"
+            )

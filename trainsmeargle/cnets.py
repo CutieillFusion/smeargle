@@ -357,9 +357,16 @@ class Model(nn.Module):
                 param.requires_grad = False
         return self._target_model
 
-    def scandata(self, datapath, tokenizerpath):
+    def scandata(self, datapath, tokenizerpath, local_rank):
         N = self.draft_vocab_size
-        if not os.path.exists("cache.pt"):
+
+        if local_rank != 0 and not os.path.exists("cache.pt"):
+            while not os.path.exists("cache.pt"):
+                time.sleep(1)
+            cache = torch.load("cache.pt")
+            d2t = cache["d2t"]
+            t2d = cache["t2d"]
+        elif local_rank == 0 and not os.path.exists("cache.pt"):
             tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
             dataset = load_dataset("json", data_files=datapath)
             dataset = dataset["train"]
@@ -470,7 +477,6 @@ class Model(nn.Module):
                 load_from_cache_file=False,
             )
             # dataset.set_format(type="torch")
-
             num_processes = num_proc
             chunk_size = len(dataset) // num_processes + (
                 len(dataset) % num_processes > 0
@@ -501,9 +507,10 @@ class Model(nn.Module):
             cache = {"d2t": d2t, "t2d": t2d}
             torch.save(cache, "cache.pt")
         else:
-            cache = torch.load("cache.pt", weights_only=False)
+            cache = torch.load("cache.pt")
             d2t = cache["d2t"]
             t2d = cache["t2d"]
+ 
         self.register_buffer("d2t", d2t)
         self.register_buffer("t2d", t2d)
         # Update draft_vocab_size to match actual computed size and fix lm_head if needed
@@ -555,7 +562,6 @@ class Model(nn.Module):
 
     def forward(
         self,
-        # hidden_states,
         input_ids,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -584,7 +590,7 @@ class Model(nn.Module):
 
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
-            seq_length_with_past += past_key_values_length
+            seq_length_with_past = seq_length_with_past + past_key_values_length
         if position_ids is None:
             device = hidden_states.device
             position_ids = torch.arange(
@@ -596,14 +602,6 @@ class Model(nn.Module):
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
-
-        # Note: attention_mask is not used by MambaBlock, but kept for API compatibility
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length_with_past),
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
 
         if self.gradient_checkpointing and self.training and use_cache:
             use_cache = False
@@ -622,7 +620,6 @@ class Model(nn.Module):
             layer_outputs, cache_hidden = self.midlayer(
                 input_emb=inputs_embeds,
                 hidden_states=hidden_states,
-                cache_state=cache_hidden,
                 use_cache=True,
             )
 
@@ -632,17 +629,7 @@ class Model(nn.Module):
             logits = self.lm_head(hidden_states_out)
             logits = logits.float()
 
-            # Check logits for NaN/Inf before LogSoftmax
-            if not torch.isfinite(logits).all():
-                nan_count = (~torch.isfinite(logits)).sum().item()
-                total_count = logits.numel()
-                # Replace NaN/Inf with zeros to prevent propagation
-                logits = torch.where(
-                    torch.isfinite(logits), logits, torch.zeros_like(logits)
-                )
-
             with torch.no_grad():
-                # hidden_states_target = padding(hidden_states, left=False)
                 target_head = target
                 target_max_token = target_head.argmax(-1)
                 # Move d2t to the same device as target_max_token
@@ -655,41 +642,23 @@ class Model(nn.Module):
                 target_p = nn.Softmax(dim=2)(target_head)
 
             out_logp = nn.LogSoftmax(dim=2)(logits)
-
-            # Check out_logp for NaN/Inf after LogSoftmax
-            if not torch.isfinite(out_logp).all():
-                nan_count = (~torch.isfinite(out_logp)).sum().item()
-                total_count = out_logp.numel()
-                # Replace NaN/Inf with a large negative value (log(0) approximation)
-                out_logp = torch.where(
-                    torch.isfinite(out_logp), out_logp, torch.full_like(out_logp, -1e6)
-                )
-
             plogp = target_p * out_logp
-            loss = -torch.sum(position_mask * plogp, 2).mean()
             sum_logit = torch.sum(position_mask * plogp, 2)
             loss = -sum_logit.mean()
-
-            # Check loss for NaN/Inf before appending
-            if not torch.isfinite(loss):
-                # Replace with zero to prevent propagation
-                loss = torch.tensor(
-                    0.0, device=loss.device, dtype=loss.dtype, requires_grad=True
-                )
-
             plosses.append(loss)
 
             acces.append(
                 ((logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1))
+                .cumprod(dim=1) 
+                * position_mask.squeeze(-1)
                 .sum()
-                .item()
+                .item() 
                 / (loss_mask.sum().item() + 1e-6)
             )
 
             if not last:
                 input_ids = padding(input_ids, left=False)
                 target = padding(target, left=False)
-                # seq_length remains the same for the next iteration
                 loss_mask = padding(loss_mask, left=False)
 
         return plosses, acces
