@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=EAGLE3
-#SBATCH --output=train_eagle3.out
-#SBATCH --error=train_eagle3.err
+#SBATCH --output=models/%j/train_eagle3.out
+#SBATCH --error=models/%j/train_eagle3.err
 #SBATCH --partition=dgxh100
 #SBATCH --time=72:00:00
 #SBATCH --gres=gpu:4
@@ -28,5 +28,5 @@ singularity exec --nv \
       --basepath /models/llama_3_1_8b_instruct \
       --trainpath /datasets/train.jsonl \
       --testpath /datasets/test.jsonl \
-      --epochs 2 \
+      --epochs 1 \
       --savedir $SAVEDIR"

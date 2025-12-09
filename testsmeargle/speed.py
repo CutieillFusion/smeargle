@@ -3,14 +3,14 @@ import json
 from transformers import AutoTokenizer
 import numpy as np
 
-parser = argparse.ArgumentParser(description="Calculate speed ratio between EAGLE3 and baseline")
-parser.add_argument("--eagle3", type=str, required=True, help="Path to EAGLE3 results jsonl file")
+parser = argparse.ArgumentParser(description="Calculate speed ratio between Smeargle and baseline")
+parser.add_argument("--smeargle", type=str, required=True, help="Path to Smeargle results jsonl file")
 parser.add_argument("--baseline", type=str, required=True, help="Path to baseline results jsonl file")
 parser.add_argument("--tokenizer-path", type=str, default="../models/llama_3_1_8b_instruct", help="Path to tokenizer")
 args = parser.parse_args()
 
 tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-jsonl_file = args.eagle3
+jsonl_file = args.smeargle
 jsonl_file_base = args.baseline
 data = []
 with open(jsonl_file, "r", encoding="utf-8") as file:

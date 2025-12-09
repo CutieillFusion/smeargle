@@ -20,5 +20,8 @@
   "transformers_version": "4.28.1",
   "use_cache": true,
   "vocab_size": 128256,
-  "draft_vocab_size": 32000
+  "draft_vocab_size": 32000,
+  "ssm_state_size": 16,
+  "ssm_conv_kernel": 4,
+  "ssm_expand": 2
 }

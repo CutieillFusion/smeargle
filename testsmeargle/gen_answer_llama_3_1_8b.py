@@ -12,13 +12,13 @@ import torch
 from fastchat.llm_judge.common import load_questions
 from tqdm import tqdm
 import scipy.stats as stats
-from model.eagle_model import EagleModel
+from model.smeargle_model import SmeargleModel
 from model.utils import prepare_logits_processor
 
 
 def run_eval(
     base_model_path: str,
-    eagle3_model_path: str,
+    smeargle_model_path: str,
     model_id: str,
     question_file: str,
     question_begin: int,
@@ -34,7 +34,7 @@ def run_eval(
     depth: int,
     top_k: int,
     warmup_steps: int,
-    use_eagle3: bool,
+    use_smeargle: bool,
 ):
     questions = load_questions(question_file, question_begin, question_end)
 
@@ -46,12 +46,12 @@ def run_eval(
     ans_handles = [
         get_answers_func(
             base_model_path,
-            eagle3_model_path,
+            smeargle_model_path,
             total_token,
             depth,
             top_k,
             warmup_steps,
-            use_eagle3,
+            use_smeargle,
             questions[i : i + chunk_size],
             answer_file,
             max_new_token,
@@ -68,12 +68,12 @@ def run_eval(
 @torch.inference_mode()
 def get_model_answers(
     base_model_path: str,
-    eagle3_model_path: str,
+    smeargle_model_path: str,
     total_token: int,
     depth: int,
     top_k: int,
     warmup_steps: int,
-    use_eagle3: bool,
+    use_smeargle: bool,
     questions: list[dict],
     answer_file: str,
     max_new_token: int,
@@ -84,9 +84,9 @@ def get_model_answers(
     temperature: float,
 ):
 
-    model = EagleModel.from_pretrained(
+    model = SmeargleModel.from_pretrained(
         base_model_path=base_model_path,
-        eagle_model_path=eagle3_model_path,
+        smeargle_model_path=smeargle_model_path,
         total_token=total_token,
         depth=depth,
         top_k=top_k,
@@ -104,7 +104,7 @@ def get_model_answers(
 
     model.eval()
 
-    generate = model.eaglegenerate if use_eagle3 else model.naivegenerate
+    generate = model.smearglegenerate if use_smeargle else model.naivegenerate
 
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     print("CUDA VISIBLE DEVICES:", cuda_visible_devices)
@@ -255,7 +255,7 @@ def get_model_answers(
                 wall_time.append(total_time)
                 messages.append({"role": "assistant", "content": output})
 
-            if use_eagle3:
+            if use_smeargle:
                 accept_length_per_position = [0.0 for _ in range(max(accept_lengths))]
                 for accept_length in accept_lengths:
                     for j in range(accept_length):
@@ -274,29 +274,18 @@ def get_model_answers(
                     for i, alpha in enumerate(accuracy_per_position[1:])
                 ]
 
-            if use_eagle3:
-                choices.append(
-                    {
-                        "index": i,
-                        "turns": turns,
-                        "idxs": idxs,
-                        "new_tokens": new_tokens,
-                        "wall_time": wall_time,
-                        "accuracy_per_position": accuracy_per_position,
-                        "alpha_per_position": alpha_per_position,
-                        "mean_acceptance_length": np.mean([int(accept_length) for accept_length in accept_lengths]),
-                    }
-                )
-            else:
-                choices.append(
-                    {
-                        "index": i,
-                        "turns": turns,
-                        "idxs": idxs,
-                        "new_tokens": new_tokens,
-                        "wall_time": wall_time,
-                    }
-                )
+            choices.append(
+                {
+                    "index": i,
+                    "turns": turns,
+                    "idxs": idxs,
+                    "new_tokens": new_tokens,
+                    "wall_time": wall_time,
+                    "accuracy_per_position": accuracy_per_position,
+                    "alpha_per_position": alpha_per_position,
+                    "mean_acceptance_length": np.mean([int(accept_length) for accept_length in accept_lengths]),
+                }
+            )
 
         # Dump answers
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
@@ -310,7 +299,7 @@ def get_model_answers(
             }
             fout.write(json.dumps(ans_json) + "\n")
 
-    if use_eagle3:
+    if use_smeargle:
         import matplotlib.pyplot as plt
 
         # Calculate the overall acceptance rate per position
@@ -355,7 +344,7 @@ def reorg_answer_file(answer_file):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--eagle3-model-path",
+        "--smeargle-model-path",
         type=str,
         required=True,
         help="The path to the weights. This can be a local folder or a Hugging Face repo ID.",
@@ -443,19 +432,19 @@ if __name__ == "__main__":
         type=str,
         default="mc_sim_7b_63",
     )
-    parser.add_argument("--use_eagle3", action="store_true")
+    parser.add_argument("--use_smeargle", action="store_true")
 
     args = parser.parse_args()
 
     question_file = f"{args.benchmark_path}/question.jsonl"
 
-    model_id = f"{args.base_model_path.split('/')[-1]}_{'eagle3' if args.use_eagle3 else 'baseline'}_temperature_{args.temperature}"
+    model_id = f"{args.base_model_path.split('/')[-1]}_{'smeargle' if args.use_smeargle else 'baseline'}_temperature_{args.temperature}"
 
     answer_file = f"{args.answer_file_path}/{model_id}.jsonl"
 
     run_eval(
         args.base_model_path,
-        args.eagle3_model_path,
+        args.smeargle_model_path,
         model_id,
         question_file,
         args.question_begin,
@@ -471,7 +460,7 @@ if __name__ == "__main__":
         args.depth,
         args.top_k,
         args.warmup_steps,
-        args.use_eagle3,
+        args.use_smeargle,
     )
 
     reorg_answer_file(answer_file)

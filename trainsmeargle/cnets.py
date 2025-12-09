@@ -246,6 +246,17 @@ def padding(tensor, left=True):
     return tensor
 
 
+def build_shifts(tensor, num_shifts):
+    """Pre-compute shifted versions of a tensor to avoid repeated padding calls."""
+    shifts = []
+    cur = tensor
+    for _ in range(num_shifts):
+        shifts.append(cur)
+        zeropad = torch.zeros_like(cur[:, -1:])
+        cur = torch.cat([cur[:, 1:], zeropad], dim=1)
+    return shifts
+
+
 def process_data(data_chunk):
 
     token_dict = Counter()
@@ -606,6 +617,13 @@ class Model(nn.Module):
         if self.gradient_checkpointing and self.training and use_cache:
             use_cache = False
 
+        self.t2d = self.t2d.to(hidden_states.device)
+
+        # Pre-compute shifted tensors to avoid repeated padding calls
+        input_ids_shifts = build_shifts(input_ids, self.length)
+        target_shifts = build_shifts(target, self.length)
+        loss_mask_shifts = build_shifts(loss_mask, self.length)
+
         cache_hidden = [
             [],
             [],
@@ -614,7 +632,14 @@ class Model(nn.Module):
         acces = []  # Initialize acces list
         for idx in range(self.length):
             last = idx == self.length - 1
+
+            # Use pre-computed shifts instead of calling padding()
+            input_ids = input_ids_shifts[idx]
+            target = target_shifts[idx]
+            loss_mask = loss_mask_shifts[idx]
+
             inputs_embeds = self.embed_tokens(input_ids)
+
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
             layer_outputs, cache_hidden = self.midlayer(
@@ -647,18 +672,14 @@ class Model(nn.Module):
             loss = -sum_logit.mean()
             plosses.append(loss)
 
-            acces.append(
-                ((logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1))
-                .cumprod(dim=1) 
-                * position_mask.squeeze(-1)
-                .sum()
-                .item() 
-                / (loss_mask.sum().item() + 1e-6)
-            )
-
-            if not last:
-                input_ids = padding(input_ids, left=False)
-                target = padding(target, left=False)
-                loss_mask = padding(loss_mask, left=False)
+            if len(acces) == 0 or acces[-1] > 0:
+                acces.append(
+                    ((logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1))
+                    .sum()
+                    .item()
+                    / (loss_mask.sum().item() + 1e-6)
+                )
+            else:
+                acces.append(0)
 
         return plosses, acces

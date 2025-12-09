@@ -1,5 +1,4 @@
 from transformers.configuration_utils import PretrainedConfig
-from typing import Union, Tuple
 
 
 class EConfig(PretrainedConfig):
@@ -59,14 +58,6 @@ class EConfig(PretrainedConfig):
             these scaling strategies behave:
             https://www.reddit.com/r/LocalLLaMA/comments/14mrgpr/dynamically_scaled_rope_further_increases/. This is an
             experimental feature, subject to breaking API changes in future versions.
-        ssm_state_size (`int`, *optional*, defaults to 16):
-            State dimension for MAMBA selective state space model.
-        ssm_conv_kernel (`int`, *optional*, defaults to 4):
-            Convolution kernel size for token mixing in MAMBA.
-        ssm_expand (`int`, *optional*, defaults to 2):
-            Expansion factor for channel mixing in MAMBA (hidden_size * expand).
-        draft_vocab_size (`int`, *optional*, defaults to 32000):
-            Vocabulary size for draft model (reduced vocabulary for efficiency).
 
         Example:
 
@@ -105,30 +96,28 @@ class EConfig(PretrainedConfig):
         pretraining_tp=1,
         tie_word_embeddings=False,
         rope_scaling=None,
-        # MAMBA-specific parameters
-        ssm_state_size=16,
-        ssm_conv_kernel=4,
-        ssm_expand=2,
-        draft_vocab_size=32000,
         **kwargs,
     ):
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
 
+        # for backward compatibility
+        if num_key_value_heads is None:
+            num_key_value_heads = num_attention_heads
+
+        self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act
+        self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.pretraining_tp = pretraining_tp
         self.use_cache = use_cache
+        self.rope_scaling = rope_scaling
+        self._rope_scaling_validation()
 
-        # MAMBA-specific parameters
-        self.ssm_state_size = ssm_state_size
-        self.ssm_conv_kernel = ssm_conv_kernel
-        self.ssm_expand = ssm_expand
-        self.draft_vocab_size = draft_vocab_size
-        self._mamba_validation()
-        print(f"MAMBA-specific parameters: ssm_state_size={self.ssm_state_size}, ssm_conv_kernel={self.ssm_conv_kernel}, ssm_expand={self.ssm_expand}")
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -137,28 +126,29 @@ class EConfig(PretrainedConfig):
             **kwargs,
         )
 
-    def _mamba_validation(self):
+    def _rope_scaling_validation(self):
         """
-        Validate MAMBA-specific configuration parameters.
+        Validate the `rope_scaling` configuration.
         """
-        # Validate ssm_state_size
-        if not isinstance(self.ssm_state_size, int) or self.ssm_state_size <= 0:
-            raise ValueError(
-                f"`ssm_state_size` must be a positive integer, got {self.ssm_state_size}"
-            )
+        if self.rope_scaling is None:
+            return
 
-        # Validate ssm_conv_kernel
-        if not isinstance(self.ssm_conv_kernel, int) or self.ssm_conv_kernel <= 0:
+        if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 2:
             raise ValueError(
-                f"`ssm_conv_kernel` must be a positive integer, got {self.ssm_conv_kernel}"
+                "`rope_scaling` must be a dictionary with with two fields, `name` and `factor`, "
+                f"got {self.rope_scaling}"
             )
-
-        # Validate ssm_expand
-        if not isinstance(self.ssm_expand, int) or self.ssm_expand < 1:
+        rope_scaling_type = self.rope_scaling.get("type", None)
+        rope_scaling_factor = self.rope_scaling.get("factor", None)
+        if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:
             raise ValueError(
-                f"`ssm_expand` must be a positive integer (typically 2-4), got {self.ssm_expand}"
+                f"`rope_scaling`'s name field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
             )
-        if self.ssm_expand > 8:
+        if (
+            rope_scaling_factor is None
+            or not isinstance(rope_scaling_factor, float)
+            or rope_scaling_factor <= 1.0
+        ):
             raise ValueError(
-                f"`ssm_expand` should be reasonable (typically 2-4), got {self.ssm_expand}"
+                f"`rope_scaling`'s factor field must be an float > 1, got {rope_scaling_factor}"
             )

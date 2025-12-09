@@ -397,6 +397,7 @@ for epoch in range(start_epoch, num_epochs):
 
     for i in range(len(epoch_acces)):
         acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
+        torch.cuda.empty_cache()
         deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
         acc_i = acc_i.item()
         if global_rank == 0:
@@ -406,6 +407,7 @@ for epoch in range(start_epoch, num_epochs):
 
     for i in range(len(epoch_plosses)):
         loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
+        torch.cuda.empty_cache()
         deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
         loss_i = loss_i.item()
         if global_rank == 0:
