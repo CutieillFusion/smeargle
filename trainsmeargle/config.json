@@ -21,7 +21,7 @@
   "use_cache": true,
   "vocab_size": 128256,
   "draft_vocab_size": 32000,
-  "ssm_state_size": 16,
-  "ssm_conv_kernel": 4,
-  "ssm_expand": 2
+  "ssm_state_size": 1,
+  "ssm_conv_kernel": 2,
+  "ssm_expand": 1
 }

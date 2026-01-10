@@ -502,12 +502,11 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaDecoderLayeremb(nn.Module):
-    def __init__(self, config, last=True):
+    def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAttention(config=config)
         self.mlp = LlamaMLP(config)
-        self.last = last
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -545,9 +544,9 @@ class LlamaDecoderLayeremb(nn.Module):
 
         hidden_states = self.hidden_norm(hidden_states)
         input_emb = self.input_layernorm(input_emb)
-
+        
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
-
+        
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -672,6 +671,8 @@ class Model(nn.Module):
 
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
+        
+        print(count_parameters(self))
 
     def init_tree(self):
         self.tree_mask_init = torch.eye(
@@ -972,7 +973,7 @@ class Model(nn.Module):
             rid,
         )
         tree_position_ids = tree_position_ids.to(hidden_states.device)
-
+        
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
 
 

@@ -4,12 +4,12 @@
         "auto_cast": "true",
         "loss_scale": 0,
         "loss_scale_window": 1000,
-        "initial_scale_power": 12,
+        "initial_scale_power": 14,
         "hysteresis": 2,
-        "min_loss_scale": 16
+        "min_loss_scale": 1
     },
     "optimizer": {
-        "type": "FusedAdam",
+        "type": "AdamW",
         "params": {
             "lr": 0,
             "weight_decay": 0.0,
@@ -42,7 +42,7 @@
     "train_batch_size": 8,
     "train_micro_batch_size_per_gpu": 1,
     "gradient_accumulation_steps": 2,
-    "gradient_clipping": 0.1,
+    "gradient_clipping": 0.5,
     "steps_per_print": 2000,
     "wall_clock_breakdown": false
 }

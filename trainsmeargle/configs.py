@@ -1,4 +1,5 @@
 from transformers.configuration_utils import PretrainedConfig
+from fla.models.mamba2 import Mamba2Config
 from typing import Union, Tuple
 
 
@@ -128,7 +129,6 @@ class EConfig(PretrainedConfig):
         self.ssm_expand = ssm_expand
         self.draft_vocab_size = draft_vocab_size
         self._mamba_validation()
-        print(f"MAMBA-specific parameters: ssm_state_size={self.ssm_state_size}, ssm_conv_kernel={self.ssm_conv_kernel}, ssm_expand={self.ssm_expand}")
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

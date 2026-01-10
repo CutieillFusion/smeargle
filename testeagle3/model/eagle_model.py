@@ -453,7 +453,8 @@ class EagleModel(nn.Module):
             logits,
             hidden_state,
             sample_token,
-        ) = initialize_tree(input_ids, self, past_key_values, logits_processor)
+        ) = initialize_tree0(input_ids, self, past_key_values, logits_processor)
+
         new_token = 0
         max_length = max_length - self.eagle_layer.total_tokens - 10
         for idx in range(max_length):

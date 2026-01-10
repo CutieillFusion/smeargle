@@ -11,7 +11,6 @@ import shortuuid
 import torch
 from fastchat.llm_judge.common import load_questions
 from tqdm import tqdm
-import scipy.stats as stats
 from model.smeargle_model import SmeargleModel
 from model.utils import prepare_logits_processor
 
@@ -104,10 +103,7 @@ def get_model_answers(
 
     model.eval()
 
-    generate = model.smearglegenerate if use_smeargle else model.naivegenerate
-
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    print("CUDA VISIBLE DEVICES:", cuda_visible_devices)
+    generate = model.smearglegenerate_sequential if use_smeargle else model.naivegenerate
 
     warmup_question = questions[0]
     for _ in range(warmup_steps):
@@ -168,9 +164,8 @@ def get_model_answers(
             output = output.strip()
 
             messages.append({"role": "assistant", "content": output})
-    print("Warmup done")
 
-    global_acceptance_lengths = [0.0 for _ in range(depth + 1)]
+    global_acceptance_lengths = [0.0 for _ in range(depth + 2)]
     for question in tqdm(questions):
         choices = []
         for i in range(num_choices):
@@ -188,12 +183,6 @@ def get_model_answers(
             for j in range(len(question["turns"])):
                 question_turn = question["turns"][j]
                 messages.append({"role": "user", "content": question_turn})
-                prompt = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-
                 prompt = tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
@@ -256,36 +245,62 @@ def get_model_answers(
                 messages.append({"role": "assistant", "content": output})
 
             if use_smeargle:
-                accept_length_per_position = [0.0 for _ in range(max(accept_lengths))]
-                for accept_length in accept_lengths:
-                    for j in range(accept_length):
-                        accept_length_per_position[j] += 1.0
+                # Convert accept_lengths to CPU integers for processing
+                accept_lengths_int = [int(al) if hasattr(al, 'item') else int(al) for al in accept_lengths]
+                
+                max_accept_len = max(accept_lengths_int) if accept_lengths_int else 0
+                accept_length_per_position = [0.0 for _ in range(max_accept_len)]
+                proposals_per_position = [0.0 for _ in range(max_accept_len)]
+
+                for al in accept_lengths_int:
+                    for pos_idx in range(min(depth + 1, max_accept_len)):
+                        proposals_per_position[pos_idx] += 1.0
+                    for pos_idx in range(al):
+                        accept_length_per_position[pos_idx] += 1.0
+                
+                # Diagnostic: Print detailed stats for first choice of each question
+                if i == 0:
+                    print(f"\n=== DIAGNOSTIC: Acceptance Stats for Question {question['question_id']} ===")
+                    print(f"Total decoding iterations: {len(accept_lengths_int)}")
+                    print(f"Accept lengths distribution: {dict(zip(*np.unique(accept_lengths_int, return_counts=True)))}")
+                    print(f"Mean accept length: {np.mean(accept_lengths_int):.2f}")
+                    print(f"\nPer-position stats (true rate = accepted/proposed at each position):")
+                    for pos in range(min(8, max_accept_len)):  # Show first 8 positions
+                        proposed = proposals_per_position[pos] if pos < len(proposals_per_position) else 0
+                        accepted = accept_length_per_position[pos] if pos < len(accept_length_per_position) else 0
+                        rate = accepted / proposed if proposed > 0 else 0
+                        print(f"  Position {pos+1}: accepted={int(accepted)}, proposed={int(proposed)}, true_rate={rate:.3f}")
+                    print("=" * 60 + "\n")
                 
                 accuracy_per_position = [
-                    accept_length_per_position[j] / len(accept_lengths)
-                    for j in range(len(accept_length_per_position))
+                    accept_length_per_position[pos_idx] / len(accept_lengths_int)
+                    for pos_idx in range(len(accept_length_per_position))
                 ]
 
-                for accept_length in accept_lengths:
-                    global_acceptance_lengths[accept_length - 1] += 1.0
+                for al in accept_lengths_int:
+                    global_acceptance_lengths[al] += 1.0
 
-                alpha_per_position = [accuracy_per_position[0]] + [
-                    alpha / accuracy_per_position[i]
-                    for i, alpha in enumerate(accuracy_per_position[1:])
-                ]
+                # Handle edge case where all accept_lengths are 0
+                if len(accuracy_per_position) > 0:
+                    alpha_per_position = [accuracy_per_position[0]] + [
+                        alpha / accuracy_per_position[idx] if accuracy_per_position[idx] > 0 else 0.0
+                        for idx, alpha in enumerate(accuracy_per_position[1:])
+                    ]
+                else:
+                    alpha_per_position = []
 
-            choices.append(
-                {
-                    "index": i,
-                    "turns": turns,
-                    "idxs": idxs,
-                    "new_tokens": new_tokens,
-                    "wall_time": wall_time,
-                    "accuracy_per_position": accuracy_per_position,
-                    "alpha_per_position": alpha_per_position,
-                    "mean_acceptance_length": np.mean([int(accept_length) for accept_length in accept_lengths]),
-                }
-            )
+            choice_data = {
+                "index": i,
+                "turns": turns,
+                "idxs": idxs,
+                "new_tokens": new_tokens,
+                "wall_time": wall_time,
+            }
+            if use_smeargle:
+                choice_data["accuracy_per_position"] = accuracy_per_position
+                choice_data["alpha_per_position"] = alpha_per_position
+                choice_data["mean_acceptance_length"] = np.mean(accept_lengths_int)
+            choices.append(choice_data)
 
         # Dump answers
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
@@ -311,7 +326,7 @@ def get_model_answers(
 
             plt.figure(figsize=(8, 5))
             plt.plot(
-                range(1, len(global_acceptance_rate) + 1),
+                range(len(global_acceptance_rate)),
                 global_acceptance_rate,
                 marker="o",
             )
@@ -441,7 +456,7 @@ if __name__ == "__main__":
     model_id = f"{args.base_model_path.split('/')[-1]}_{'smeargle' if args.use_smeargle else 'baseline'}_temperature_{args.temperature}"
 
     answer_file = f"{args.answer_file_path}/{model_id}.jsonl"
-
+    
     run_eval(
         args.base_model_path,
         args.smeargle_model_path,

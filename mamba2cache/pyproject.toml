@@ -1,5 +1,5 @@
 [project]
-name = "test-smeargle"
+name = "mamba2cache"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -14,7 +14,6 @@ dependencies = [
     "anthropic==0.5.0",
     "sentencepiece==0.2.1",
     "protobuf==3.19.0",
-    "deepspeed>=0.14.5",
     "huggingface-hub>=0.24.0,",
     "black>=24.4.2",
     "einops>=0.8.1",

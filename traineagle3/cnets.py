@@ -35,6 +35,7 @@ from safetensors import safe_open
 from datasets import load_dataset
 import multiprocessing
 import time
+from transformers import AutoTokenizer
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -398,9 +399,8 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaMLP(nn.Module):
-    def __init__(self, config, last=True):
+    def __init__(self, config):
         super().__init__()
-        self.last = last
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -461,12 +461,11 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaDecoderLayeremb(nn.Module):
-    def __init__(self, config, last=True):
+    def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAttention(config=config)
-        self.mlp = LlamaMLP(config, last=last)
-        self.last = last
+        self.mlp = LlamaMLP(config)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -966,6 +965,8 @@ class Model(nn.Module):
         ]  # Initialize cache_hidden as list of two empty lists (cache_k, cache_v)
         plosses = []  # Initialize plosses list
         acces = []  # Initialize acces list
+        last_target_max = None
+        last_logits = None
         for idx in range(self.length):
             last = idx == self.length - 1
             # Use pre-computed shifts instead of calling padding()
@@ -1011,6 +1012,29 @@ class Model(nn.Module):
             sum_logit = torch.sum(position_mask * plogp, 2)
             loss = -sum_logit.mean()
             plosses.append(loss)
+            last_target_max = target_max_token
+            last_logits = logits
+
+            # Optional debug logging (mirrors inference logging style)
+            if os.getenv("TRAIN_DEBUG", ""):
+                try:
+                    if not hasattr(self, "_debug_tokenizer"):
+                        # Prefer the target model path if provided
+                        tok_path = (
+                            self._target_model_path
+                            if hasattr(self, "_target_model_path")
+                            else None
+                        )
+                        if tok_path is None:
+                            tok_path = getattr(self, "path", None)
+                        self._debug_tokenizer = AutoTokenizer.from_pretrained(
+                            tok_path if tok_path is not None else "",
+                            use_fast=False,
+                        )
+                except Exception:
+                    if not hasattr(self, "_debug_log_failed"):
+                        self._debug_log_failed = True
+                        print("Debug tokenizer init failed")
  
             if len(acces) == 0 or acces[-1] > 0:
                 acces.append(
@@ -1021,5 +1045,33 @@ class Model(nn.Module):
                 )
             else:
                 acces.append(0)
+
+        # After loop: log all target/pred tokens for valid positions
+        if os.getenv("TRAIN_DEBUG", "") and last_target_max is not None and last_logits is not None:
+            try:
+                tok = getattr(self, "_debug_tokenizer", None)
+                if tok is not None:
+                    import json
+                    valid_positions = (loss_mask[0] > 0).nonzero(as_tuple=True)[0]
+                    target_ids = last_target_max[0, valid_positions].detach().cpu().tolist()
+                    pred_ids = last_logits.argmax(-1)[0, valid_positions].detach().cpu()
+                    if self.vocab_size != self.draft_vocab_size:
+                        d2t = self.d2t.to(pred_ids.device)
+                        pred_ids = (pred_ids + d2t[pred_ids]).cpu()
+                    pred_ids_list = pred_ids.tolist()
+                    record = {
+                        "pos": valid_positions.tolist(),
+                        "target_ids": target_ids,
+                        "pred_ids": pred_ids_list,
+                        "target_text": tok.decode(target_ids, skip_special_tokens=True),
+                        "pred_text": tok.decode(pred_ids_list, skip_special_tokens=True),
+                    }
+                    line = json.dumps(record, ensure_ascii=False) + "\n"
+                    with open("train_debug.jsonl", "a+", encoding="utf-8") as f:
+                        f.write(line)
+            except Exception as e:
+                if not hasattr(self, "_debug_log_failed"):
+                    self._debug_log_failed = True
+                    print(f"Debug log failed: {e}")
 
         return plosses, acces

@@ -192,9 +192,3 @@ def reset_past_key_values(passed_key_values: List[torch.Tensor]) -> List[torch.T
             passed_key_values[i][j].current_length.fill_(0)
     return passed_key_values
 
-
-if __name__ == "__main__":
-    from choices import mc_sim_7b_63
-
-    a = generate_tree_buffers(mc_sim_7b_63)
-    print(a)

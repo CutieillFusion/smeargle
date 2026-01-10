@@ -218,6 +218,7 @@ class SmeargleModel(nn.Module):
 
         padding = (torch.zeros(1, 1, dtype=torch.long) - 1).to(input_ids.device)
         input_ids = input_ids.clone()
+        # Manage Mamba cache internally per prompt
         self.smeargle_layer.reset_kv()
 
         # Initialize the past key and value states
@@ -254,6 +255,12 @@ class SmeargleModel(nn.Module):
         new_token = 0
         max_length = max_length - self.smeargle_layer.total_tokens - 10
         accept_lengths = []
+        
+        # Optional debug logging
+        debug_enabled = os.getenv("TEST_DEBUG", "")
+        if debug_enabled:
+            debug_log_file = os.getenv("TEST_DEBUG_FILE", "inference_debug.jsonl")
+        
         for idx in range(max_length):
             self.base_model.model.tree_mask = tree_mask
 
@@ -277,6 +284,43 @@ class SmeargleModel(nn.Module):
                 logits, candidates, logits_processor
             )
             accept_lengths.append(accept_length)
+            
+            # Debug logging
+            if debug_enabled:
+                try:
+                    # Candidates are already in base vocab space (mapped in topK_genrate if needed)
+                    all_candidates = candidates.detach().cpu()
+                    
+                    # Get accepted tokens from best candidate
+                    best_candidate_idx = best_candidate.item() if isinstance(best_candidate, torch.Tensor) else best_candidate
+                    accept_len = accept_length.item() if isinstance(accept_length, torch.Tensor) else accept_length
+                    accepted_tokens = all_candidates[best_candidate_idx, :accept_len + 1].detach().cpu()  # +1 for the sample token
+                    
+                    # Filter out padding tokens (-1)
+                    valid_accepted = accepted_tokens[accepted_tokens >= 0].tolist()
+                    all_candidates_list = []
+                    for i in range(all_candidates.shape[0]):
+                        candidate_tokens = all_candidates[i].detach().cpu()
+                        valid_candidate = candidate_tokens[candidate_tokens >= 0].tolist()
+                        all_candidates_list.append(valid_candidate)
+                    
+                    record = {
+                        "step": idx,
+                        "best_candidate": best_candidate_idx,
+                        "accept_length": accept_len,
+                        "accepted_ids": valid_accepted,
+                        "accepted_text": self.tokenizer.decode(valid_accepted, skip_special_tokens=True),
+                        "all_candidates_ids": all_candidates_list,
+                        "all_candidates_text": [self.tokenizer.decode(cand, skip_special_tokens=True) for cand in all_candidates_list],
+                    }
+                    
+                    line = json.dumps(record, ensure_ascii=False) + "\n"
+                    with open(debug_log_file, "a+", encoding="utf-8") as f:
+                        f.write(line)
+                except Exception as e:
+                    if not hasattr(self, "_debug_log_failed"):
+                        self._debug_log_failed = True
+                        print(f"Inference debug log failed: {e}")
 
             # Adjusting the input sequence, draft model forward
             (
@@ -302,6 +346,198 @@ class SmeargleModel(nn.Module):
                 hidden_state_new,
                 sample_p,
             )
+
+            if is_llama3:
+                if stop_token_id in input_ids[0, input_len:].tolist():
+                    break
+
+            if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
+                break
+            if new_token > max_new_tokens:
+                break
+            if input_ids.shape[1] > max_length:
+                break
+
+        if not log:
+            return input_ids
+        else:
+            return input_ids, new_token, idx, accept_lengths
+
+    @torch.no_grad()
+    def smearglegenerate_sequential(
+        self,
+        input_ids,
+        temperature=0.0,
+        top_p=0.0,
+        top_k=0.0,
+        max_new_tokens=512,
+        max_length=2048,
+        log=False,
+        is_llama3=False,
+    ):
+        """Sequential speculative decoding without tree structure.
+        Generates draft tokens one at a time and verifies them sequentially."""
+        if is_llama3:
+            stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+
+        if temperature > 1e-5:
+            logits_processor = prepare_logits_processor(
+                temperature=temperature, top_p=top_p, top_k=top_k
+            )
+        else:
+            logits_processor = None
+
+        input_ids = input_ids.clone()
+        self.smeargle_layer.reset_kv()
+
+        # Initialize the past key and value states
+        if hasattr(self, "past_key_values"):
+            past_key_values = self.past_key_values
+            past_key_values_data = self.past_key_values_data
+            current_length_data = self.current_length_data
+            current_length_data.zero_()
+        else:
+            (
+                past_key_values,
+                past_key_values_data,
+                current_length_data,
+            ) = initialize_past_key_values(self.base_model, max_length=max_length)
+            self.past_key_values = past_key_values
+            self.past_key_values_data = past_key_values_data
+            self.current_length_data = current_length_data
+
+        input_len = input_ids.shape[1]
+        reset_tree_mode(self)
+        
+        # Initial forward pass to get hidden states
+        outputs, orig, hidden_states = self(
+            input_ids, past_key_values=past_key_values, output_orig=True
+        )
+        
+        # Sample initial token
+        if logits_processor is not None:
+            logits = orig[:, -1]
+            logits = logits_processor(None, logits)
+            probabilities = torch.nn.functional.softmax(logits, dim=1)
+            sample_token = torch.multinomial(probabilities, 1)
+        else:
+            sample_token = torch.argmax(orig[:, -1])
+            sample_token = sample_token[None, None]
+        
+        input_ids = torch.cat((input_ids, sample_token.to(input_ids.device)), dim=1)
+        
+        # Get hidden states for draft model
+        ea_device = self.smeargle_layer.lm_head.weight.device
+        if outputs["hidden_states"][0].device != ea_device:
+            outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
+        hidden_states = torch.cat(outputs["hidden_states"], dim=-1)
+
+        new_token = 0
+        max_length = max_length - self.smeargle_layer.total_tokens - 10
+        accept_lengths = []
+        
+        # Optional debug logging
+        debug_enabled = os.getenv("TEST_DEBUG", "")
+        if debug_enabled:
+            debug_log_file = os.getenv("TEST_DEBUG_FILE", "inference_debug.jsonl")
+        
+        for idx in range(max_length):
+            # Generate draft tokens sequentially
+            draft_tokens, draft_hidden_state = self.smeargle_layer.sequential_generate(
+                hidden_states, input_ids, self.base_model.lm_head, logits_processor
+            )
+            
+            # Verify draft tokens sequentially with base model
+            accepted_tokens = []
+            accept_length = 0
+            current_context = input_ids
+            current_past_kv = past_key_values
+            
+            # Verify each draft token one by one
+            # sample_token (draft_tokens[0]) is already in input_ids, so start from draft_tokens[1]
+            for i in range(1, len(draft_tokens)):
+                draft_token = draft_tokens[i].item()
+                
+                # Get base model's prediction for next token given current context
+                base_outputs = self.base_model(
+                    current_context[:, -1:], use_cache=True, past_key_values=current_past_kv
+                )
+                base_logits = base_outputs.logits[:, -1]  # (1, vocab_size)
+                
+                # Get base model's predicted token
+                if logits_processor is not None:
+                    processed_logits = logits_processor(None, base_logits)
+                    base_probs = torch.nn.functional.softmax(processed_logits, dim=-1)
+                    base_token = torch.multinomial(base_probs, 1).item()
+                else:
+                    base_token = base_logits.argmax(dim=-1).item()
+                
+                # Check if draft token matches base model's prediction
+                if draft_token == base_token:
+                    accepted_tokens.append(draft_token)
+                    accept_length += 1
+                    # Update context with accepted token
+                    draft_token_tensor = torch.tensor([[draft_token]], device=input_ids.device)
+                    current_context = torch.cat([current_context, draft_token_tensor], dim=-1)
+                    # Forward accepted token to update cache
+                    base_outputs = self.base_model(
+                        draft_token_tensor, use_cache=True, past_key_values=current_past_kv
+                    )
+                    current_past_kv = base_outputs.past_key_values
+                else:
+                    # Reject: use base model's token and stop
+                    base_token_tensor = torch.tensor([[base_token]], device=input_ids.device)
+                    current_context = torch.cat([current_context, base_token_tensor], dim=-1)
+                    current_past_kv = base_outputs.past_key_values
+                    break
+            
+            # Update input_ids and past_key_values
+            input_ids = current_context
+            past_key_values = current_past_kv
+            
+            # Ensure past_key_values is valid (not None and not containing None elements)
+            # The base model expects a tuple of KV caches where each element is a tuple of (key, value)
+            if past_key_values is None:
+                # Use the stored past_key_values if current_past_kv is None
+                past_key_values = self.past_key_values
+            elif isinstance(past_key_values, tuple) and len(past_key_values) > 0:
+                # Check if the first layer's KV cache is None
+                if past_key_values[0] is None or (isinstance(past_key_values[0], tuple) and len(past_key_values[0]) > 0 and past_key_values[0][0] is None):
+                    # Use the stored past_key_values if current_past_kv has None elements
+                    past_key_values = self.past_key_values
+            
+            new_token += len(accepted_tokens) + 1  # +1 for the base model token
+            
+            # Update hidden states for next iteration
+            outputs, orig, hidden_states = self(
+                input_ids, past_key_values=past_key_values, output_orig=True
+            )
+            if outputs["hidden_states"][0].device != ea_device:
+                outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
+            hidden_states = torch.cat(outputs["hidden_states"], dim=-1)
+            
+            accept_lengths.append(accept_length)
+            
+            # Debug logging
+            if debug_enabled:
+                try:
+                    all_draft = draft_tokens[1:].detach().cpu().tolist()  # Skip sample token
+                    record = {
+                        "step": idx,
+                        "best_candidate": 0,  # Sequential has only one candidate
+                        "accept_length": accept_length,
+                        "accepted_ids": accepted_tokens,
+                        "accepted_text": self.tokenizer.decode(accepted_tokens, skip_special_tokens=True),
+                        "all_candidates_ids": [all_draft],
+                        "all_candidates_text": [self.tokenizer.decode(all_draft, skip_special_tokens=True)],
+                    }
+                    line = json.dumps(record, ensure_ascii=False) + "\n"
+                    with open(debug_log_file, "a+", encoding="utf-8") as f:
+                        f.write(line)
+                except Exception as e:
+                    if not hasattr(self, "_debug_log_failed"):
+                        self._debug_log_failed = True
+                        print(f"Inference debug log failed: {e}")
 
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():

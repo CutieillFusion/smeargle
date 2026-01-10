@@ -649,7 +649,6 @@ class LlamaAttention(nn.Module):
                 else:
                     raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
             except:
-                # print("For LLaMA 31")
                 self.rotary_emb = LlamaRotaryEmbedding_L31(config=self.config)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
