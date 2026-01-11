@@ -35,6 +35,7 @@ from safetensors import safe_open
 from datasets import load_dataset
 import multiprocessing
 from transformers.models.mamba2.modeling_mamba2 import Mamba2Cache, Mamba2Block
+from transformers.integrations import use_kernel_forward_from_hub
 
 
 class Mamba2(nn.Module):
@@ -53,12 +54,7 @@ class Mamba2(nn.Module):
         hidden_states: torch.Tensor,
         cache_params: Optional[Mamba2Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Mamba2Cache], Optional[torch.LongTensor]]:
-    
-        if use_cache and cache_params is None:
-            cache_params = Mamba2Cache(self.config, hidden_states.size(0), device=hidden_states.device, dtype=hidden_states.dtype)
-            cache_position = torch.arange(0, hidden_states.size(0), device=hidden_states.device, dtype=torch.long)
 
         output = self.mamba2(
             hidden_states=hidden_states,
@@ -85,39 +81,11 @@ class LlamaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        if self.config.pretraining_tp > 1:
-            slice = self.intermediate_size // self.config.pretraining_tp
-            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
-            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
-            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
-
-            gate_proj = torch.cat(
-                [
-                    F.linear(x, gate_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
-                dim=-1,
-            )
-            up_proj = torch.cat(
-                [
-                    F.linear(x, up_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
-                dim=-1,
-            )
-
-            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
-            down_proj = [
-                F.linear(intermediate_states[i], down_proj_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            down_proj = sum(down_proj)
-        else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
 
+@use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -133,6 +101,9 @@ class LlamaRMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
 class SmeargleDecoderLayeremb(nn.Module):
@@ -154,7 +125,6 @@ class SmeargleDecoderLayeremb(nn.Module):
         hidden_states: torch.Tensor,
         cache_params: Optional[Mamba2Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = False,
     ) -> Tuple[torch.FloatTensor, Optional[Mamba2Cache], Optional[torch.LongTensor]]:
         """
         Args:
@@ -162,7 +132,6 @@ class SmeargleDecoderLayeremb(nn.Module):
             hidden_states: Hidden states from target model (batch, seq_len, hidden_size)
             cache_params: Mamba2Cache for incremental processing
             cache_position: Tensor indicating position in sequence for cache
-            use_cache: Whether to return updated state
         """
 
         residual = hidden_states
@@ -174,14 +143,11 @@ class SmeargleDecoderLayeremb(nn.Module):
             (input_emb, hidden_states), dim=-1
         )
 
-        return_hidden = hidden_states
-
         # MAMBA block
         hidden_states, cache_params, cache_position = self.mamba2(
             hidden_states=hidden_states,
             cache_params=cache_params,
             cache_position=cache_position,
-            use_cache=use_cache,
         )
         hidden_states = residual + hidden_states
 
@@ -191,7 +157,7 @@ class SmeargleDecoderLayeremb(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, return_hidden)
+        outputs = (hidden_states)
 
         return outputs, cache_params, cache_position
 
@@ -207,7 +173,6 @@ def padding(tensor, left=True):
 
 
 def process_data(data_chunk):
-
     token_dict = Counter()
     input_ids = data_chunk["input_ids"]
     loss_mask = data_chunk["loss_mask"]
@@ -222,7 +187,7 @@ def process_data(data_chunk):
 
 
 def merge_dicts(dicts):
-    """合并多个 Counter 字典"""
+    """Merge multiple Counter dictionaries"""
     result = Counter()
     for d in dicts:
         result.update(d)
@@ -233,20 +198,13 @@ class Model(nn.Module):
     def __init__(
         self,
         config,
-        ds_config,
         training_config,
-        load_head=False,
         load_emb=True,
         path=None,
     ):
         super().__init__()
         self.train_config = training_config
-        # Settng dschf to allow efficient ZeRO-3 usage between hf and ds.
-        if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
-            dschf = HfDeepSpeedConfig(ds_config)
-        else:
-            dschf = None
-
+        self.config = config
         self.midlayer = SmeargleDecoderLayeremb(config)
         self.gradient_checkpointing = self.train_config["gradient_checkpoint"]
         self.padding_idx = config.pad_token_id
@@ -371,8 +329,6 @@ class Model(nn.Module):
 
                     sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
 
-                    total_len = len(input_ids)
-
                     sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
                     turns = conversation.split(sep2)
 
@@ -466,7 +422,6 @@ class Model(nn.Module):
                 self.lm_head.weight.data = old_lm_head.weight.data[
                     :actual_draft_vocab_size
                 ].clone()
-        self.l1smooth = nn.SmoothL1Loss(reduction="none")
 
     @torch.no_grad()
     def dataprepare(self, input_ids, attention_mask, loss_mask):
@@ -498,9 +453,8 @@ class Model(nn.Module):
         self,
         input_ids,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
         loss_mask: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
     ):
         hidden_states, target, loss_mask, input_ids = self.dataprepare(
             input_ids, attention_mask, loss_mask
@@ -520,32 +474,31 @@ class Model(nn.Module):
         if self.gradient_checkpointing and self.training and use_cache:
             use_cache = False
 
-        self.t2d = self.t2d.to(hidden_states.device)
-
         cache_params: Optional[Mamba2Cache] = None
         cache_position: Optional[torch.LongTensor] = None
+        if use_cache:
+            cache_params = Mamba2Cache(self.config, batch_size, device=hidden_states.device, dtype=hidden_states.dtype)
+            cache_position = torch.arange(0, seq_length, device=hidden_states.device, dtype=torch.long)
+
+        self.t2d = self.t2d.to(hidden_states.device)
+
         plosses = []
         acces = []
-        last_target_max = None
-        last_logits = None
         for idx in range(self.length):
 
             inputs_embeds = self.embed_tokens(input_ids)
 
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
-            layer_outputs, cache_params, cache_position = self.midlayer(
+            hidden_states, cache_params, cache_position = self.midlayer(
                 input_emb=inputs_embeds,
                 hidden_states=hidden_states,
                 cache_params=cache_params,
                 cache_position=cache_position,
-                use_cache=True,
             )
 
-            hidden_states_out = layer_outputs[0]
-            hidden_states = hidden_states_out
-            hidden_states_out = self.norm(hidden_states_out)
-            logits = self.lm_head(hidden_states_out)
+            hidden_states = self.norm(hidden_states)
+            logits = self.lm_head(hidden_states)
             logits = logits.float()
 
             with torch.no_grad():
@@ -565,8 +518,6 @@ class Model(nn.Module):
             sum_logit = torch.sum(position_mask * plogp, 2)
             loss = -sum_logit.mean()
             plosses.append(loss)
-            last_target_max = target_max_token
-            last_logits = logits
         
             if len(acces) == 0 or acces[-1] > 0:
                 acces.append(
@@ -603,6 +554,6 @@ if __name__ == "__main__":
         "config_path": "config.json",
         "gradient_checkpoint": True,
     }
-    model = Model(config, ds_config, training_config, load_emb=False)
+    model = Model(config, training_config, load_emb=False)
     print(f"Number of parameters: {count_parameters(model):,}")
     print_model_summary(model)

@@ -204,7 +204,7 @@ testdataset = build_dataset_rank(tokenizer, args.testpath)
 
 config = SmeargleConfig.from_pretrained(train_config["config_path"])
 model = Model(
-    config, ds_config, train_config, path=args.basepath, load_emb=True, load_head=True
+    config, train_config, path=args.basepath, load_emb=True
 )
 model.scandata(args.trainpath, args.basepath, args.local_rank)
 

@@ -25,6 +25,5 @@
   "conv_kernel": 4,
   "expand": 2,
   "n_groups": 8,
-  "residual_in_fp32": true,
-  "pretraining_tp": 1
+  "residual_in_fp32": true
 }
