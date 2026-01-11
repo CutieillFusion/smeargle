@@ -37,6 +37,6 @@ singularity exec --nv \
       --basepath /models/llama_3_1_8b_instruct \
       --trainpath /datasets/train_5k.jsonl \
       --testpath /datasets/test_5k.jsonl \
-      --epochs 2 \
+      --epochs 1 \
       --savedir $SAVEDIR
   "

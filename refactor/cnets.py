@@ -499,10 +499,7 @@ class Model(nn.Module):
         input_ids,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
         use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
         loss_mask: Optional[torch.Tensor] = None,
     ):
         hidden_states, target, loss_mask, input_ids = self.dataprepare(
@@ -510,8 +507,6 @@ class Model(nn.Module):
         )
 
         batch_size, seq_length, _ = hidden_states.shape
-        seq_length_with_past = seq_length
-        past_key_values_length = 0
 
         if (
             self.training
@@ -521,21 +516,6 @@ class Model(nn.Module):
             hidden_states.requires_grad = True
 
         hidden_states = self.fc(hidden_states)
-
-        if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
-        if position_ids is None:
-            device = hidden_states.device
-            position_ids = torch.arange(
-                past_key_values_length,
-                seq_length + past_key_values_length,
-                dtype=torch.long,
-                device=device,
-            )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-        else:
-            position_ids = position_ids.view(-1, seq_length).long()
 
         if self.gradient_checkpointing and self.training and use_cache:
             use_cache = False

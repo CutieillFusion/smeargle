@@ -2,25 +2,26 @@ import argparse
 import deepspeed
 import json
 import re
-from transformers import AutoTokenizer
 import os
 import torch
-torch.backends.cuda.matmul.allow_tf32 = True
-from accelerate.utils import set_seed
-
-set_seed(0)
 from cnets import Model
 from configs import SmeargleConfig
 from datasets import load_dataset
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
-
-from torch import nn, optim
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from typing import Any, Dict, List
+from torch import optim
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
+from transformers import AutoTokenizer
+from deepspeed.runtime.fp16.loss_scaler import DynamicLossScaler
+from deepspeed.runtime.zero.config import ZeroStageEnum
+from deepspeed.utils.tensor_fragment import fragment_address
+from accelerate.utils import set_seed
 
-import numpy as np
-from transformers import PreTrainedTokenizerBase, get_linear_schedule_with_warmup
+set_seed(0)
+# This makes the model run faster on Ampere GPUs
+torch.backends.cuda.matmul.allow_tf32 = True
+# Add safe globals to prevent issues with checkpoint loading
+torch.serialization.add_safe_globals([DynamicLossScaler, ZeroStageEnum, fragment_address])
 
 parser = argparse.ArgumentParser(description="sp")
 parser.add_argument("--basepath", type=str, required=True)
@@ -61,42 +62,11 @@ train_config = {
     "gradient_checkpoint": True,
 }
 
-try:
-    from deepspeed.runtime.fp16.loss_scaler import DynamicLossScaler
-    from deepspeed.runtime.zero.config import ZeroStageEnum
-
-    torch.serialization.add_safe_globals([DynamicLossScaler, ZeroStageEnum])
-except ImportError:
-    pass  # DeepSpeed not loaded yet, will add later if needed
-
-# Add fragment_address separately as it may not be available in all DeepSpeed versions
-# Import the module first to ensure it's loaded, then get the attribute
-_fragment_address_registered = False
-try:
-    import deepspeed.utils.tensor_fragment as tf_module
-
-    if hasattr(tf_module, "fragment_address"):
-        fragment_address = tf_module.fragment_address
-        torch.serialization.add_safe_globals([fragment_address])
-        _fragment_address_registered = True
-except (ImportError, AttributeError) as e:
-    # Fallback: try direct import
-    try:
-        from deepspeed.utils.tensor_fragment import fragment_address
-
-        torch.serialization.add_safe_globals([fragment_address])
-        _fragment_address_registered = True
-    except (ImportError, AttributeError):
-        pass  # fragment_address not available, may cause issues with checkpoint loading
-
-
 def build_dataset_rank(tokenizer, datapath):
 
     ds = load_dataset("json", data_files=datapath)
     ds = ds["train"]
     ds = ds.shuffle(seed=42)
-    ds1 = ds
-    original_columns1 = ds1.column_names
     num_proc = 48
 
     def preprocess_function(examples):
@@ -147,8 +117,6 @@ def build_dataset_rank(tokenizer, datapath):
 
             sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
 
-            total_len = len(input_ids)
-
             sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
             turns = conversation.split(sep2)
 
@@ -187,25 +155,19 @@ def build_dataset_rank(tokenizer, datapath):
 
         return new_examples
 
-    ds1 = ds1.map(
+    ds = ds.map(
         preprocess_function,
         batched=True,
         num_proc=num_proc,
-        remove_columns=original_columns1,
+        remove_columns=ds.column_names,
         load_from_cache_file=False,
     )
-
-    ds1.set_format(type="torch")
-    return ds1
+    
+    ds.set_format(type="torch")
+    return ds
 
 
 class DataCollatorWithPadding:
-
-    def paddingtensor(self, intensors, N):
-        B, n, S = intensors.shape
-        padding_tensor = torch.zeros(B, N - n, S, dtype=intensors.dtype)
-        outtensors = torch.cat((intensors, padding_tensor), dim=1)
-        return outtensors
 
     def paddingtensor2D(self, intensors, N):
         B, n = intensors.shape
@@ -246,8 +208,6 @@ model = Model(
 )
 model.scandata(args.trainpath, args.basepath, args.local_rank)
 
-criterion = nn.SmoothL1Loss(reduction="none")
-
 num_epochs = train_config["num_epochs"]
 
 # Create PyTorch AdamW optimizer manually to bypass DeepSpeed's FusedAdam (which fails on compute_90)
@@ -271,15 +231,6 @@ model_engine, optimizer, _, _ = deepspeed.initialize(
     optimizer=optimizer,
     model_parameters=model.parameters(),
 )
-
-# Ensure checkpoint engine uses weights_only=False if fragment_address registration failed
-if not _fragment_address_registered and hasattr(model_engine, "checkpoint_engine"):
-    original_load = model_engine.checkpoint_engine.load
-
-    def patched_checkpoint_load(path, map_location=None):
-        return torch.load(path, map_location=map_location, weights_only=False)
-
-    model_engine.checkpoint_engine.load = patched_checkpoint_load
 
 global_rank = deepspeed.comm.get_rank()
 rank = deepspeed.comm.get_local_rank()
@@ -332,36 +283,29 @@ def find_max_state_with_file(directory, filename="zero_to_fp32.py"):
 checkpoint_path, start_epoch = find_max_state_with_file(args.savedir)
 if checkpoint_path:
     print(f"load from {checkpoint_path}")
-    # Ensure fragment_address is registered before loading checkpoint (safety check)
-    if not _fragment_address_registered:
-        try:
-            import deepspeed.utils.tensor_fragment as tf_module
+    model_engine.load_checkpoint(checkpoint_path)
 
-            if hasattr(tf_module, "fragment_address"):
-                fragment_address = tf_module.fragment_address
-                torch.serialization.add_safe_globals([fragment_address])
-                _fragment_address_registered = True
-        except (ImportError, AttributeError):
-            try:
-                from deepspeed.utils.tensor_fragment import fragment_address
+def print_rank(message: str):
+    if global_rank == 0:
+        print(message)
 
-                torch.serialization.add_safe_globals([fragment_address])
-                _fragment_address_registered = True
-            except (ImportError, AttributeError):
-                pass
-    # Set strict=False to allow missing frozen parameters (like embed_tokens.weight)
-    # which are excluded when saving with exclude_frozen_parameters=True
-    model_engine.load_checkpoint(checkpoint_path, load_module_strict=False)
+def reduce_and_print(epoch_metrics: list[list[float]], mode: str, metric_name: str, epoch: int) -> float:
+    total_metric = 0
+    for i, metric in enumerate(epoch_metrics):
+        metric = torch.tensor(metric).cuda().mean()
+        torch.cuda.empty_cache()
+        deepspeed.comm.all_reduce(metric, op=deepspeed.comm.ReduceOp.AVG)
+        print_rank(f"{mode} Epoch [{epoch + 1}/{num_epochs}], position {i}, {metric_name}: {metric.item():.2f}")
+        total_metric += metric.item()
+    return total_metric / len(epoch_metrics)
 
-
-# Initialize early stopping variables
-best_test_ploss_pos0 = float("inf")
+best_test_ploss = float("inf")
 patience_counter = 0
 best_epoch = -1
 
 for epoch in range(start_epoch, num_epochs):
     train_sampler.set_epoch(epoch + 1)
-    print(f"Now training epoch {epoch}")
+    print_rank(f"Now training epoch {epoch}")
 
     model.train()
     epoch_acces = [[] for _ in range(model.length)]
@@ -390,29 +334,13 @@ for epoch in range(start_epoch, num_epochs):
             epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
         ]
 
-    for i in range(len(epoch_acces)):
-        acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
-        torch.cuda.empty_cache()
-        deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
-        acc_i = acc_i.item()
-        if global_rank == 0:
-            print(
-                f"Train Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}"
-            )
-
-    for i in range(len(epoch_plosses)):
-        loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
-        torch.cuda.empty_cache()
-        deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
-        loss_i = loss_i.item()
-        if global_rank == 0:
-            print(
-                f"Train Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}"
-            )
+    reduce_and_print(epoch_acces, "Train", "Acc", epoch)
+    reduce_and_print(epoch_plosses, "Train", "pLoss", epoch)
 
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
 
+    model.eval()
     for batch_idx, data in enumerate(tqdm(test_loader)):
         with torch.no_grad():
             device = next(model_engine.module.parameters()).device
@@ -426,81 +354,32 @@ for epoch in range(start_epoch, num_epochs):
                 epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
             ]
 
-    for i in range(len(epoch_acces)):
-        acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
-        deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
-        acc_i = acc_i.item()
-        if global_rank == 0:
-            print(
-                f"Test Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}"
-            )
+    reduce_and_print(epoch_acces, "Test", "Acc", epoch)
+    test_ploss = reduce_and_print(epoch_plosses, "Test", "pLoss", epoch)
 
-    test_ploss_pos0 = None
-    for i in range(len(epoch_plosses)):
-        loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
-        deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
-        loss_i = loss_i.item()
-        if i == 0:
-            test_ploss_pos0 = loss_i
-        if global_rank == 0:
-            print(
-                f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}"
-            )
-
-    # Early stopping based on test pLoss at position 0
-    if args.patience is not None and test_ploss_pos0 is not None:
-        if test_ploss_pos0 < best_test_ploss_pos0:
-            best_test_ploss_pos0 = test_ploss_pos0
+    # Early stopping based on test pLoss on average test position loss
+    if args.patience is not None:
+        if test_ploss < best_test_ploss:
+            best_test_ploss = test_ploss
             best_epoch = epoch
             patience_counter = 0
-            if global_rank == 0:
-                print(
-                    f"New best test pLoss at position 0: {best_test_ploss_pos0:.4f} at epoch {epoch + 1}"
-                )
-                # Save best model
-                model_engine.save_16bit_model(
-                    f"{args.savedir}/best_model", exclude_frozen_parameters=True
-                )
+            print_rank(f"New best test pLoss: {best_test_ploss:.4f} at epoch {epoch + 1}")
+            model_engine.save_16bit_model(f"{args.savedir}/best_model", exclude_frozen_parameters=True)
         else:
-            if global_rank == 0:
-                print(
-                    f"No improvement in test pLoss at position 0. Patience: {patience_counter}/{args.patience}"
-                )
+            print_rank(f"No improvement in test pLoss. Patience: {patience_counter}/{args.patience}")
 
             if patience_counter >= args.patience:
-                if global_rank == 0:
-                    print(
-                        f"Early stopping triggered! Best test pLoss at position 0: {best_test_ploss_pos0:.4f} at epoch {best_epoch + 1}"
-                    )
+                print_rank(f"Early stopping triggered! Best test pLoss: {best_test_ploss:.4f} at epoch {best_epoch + 1}")
                 break
             patience_counter += 1
 
-    # clear out the redundance cahce after each step
+    # clear out the redundance cache after each step
     torch.cuda.empty_cache()
 
     model_engine.save_16bit_model(
         f"{args.savedir}/state_{epoch}", exclude_frozen_parameters=True
     )
-    if epoch % 10 == 0:
-        try:
-            # Save checkpoint with frozen parameters excluded to avoid tracking issues
-            # The target_model is not a registered submodule, so DeepSpeed can't track its frozen params
-            model_engine.save_checkpoint(
-                save_dir=f"{args.savedir}/state_{epoch}", exclude_frozen_parameters=True
-            )
-        except ValueError as e:
-            if "failed to find frozen" in str(e):
-                # If frozen parameter tracking fails, skip checkpoint save but log warning
-                # The 16-bit model is already saved above, so training can continue
-                if global_rank == 0:
-                    print(
-                        f"Warning: Could not save DeepSpeed checkpoint due to frozen parameter tracking issue."
-                    )
-                    print(
-                        f"         The 16-bit model has been saved and training will continue."
-                    )
-                    print(
-                        f"         Note: You may need to restart training from the 16-bit model if resuming."
-                    )
-            else:
-                raise
+
+# Explicit cleanup to prevent leaking resources
+deepspeed.comm.barrier()
+deepspeed.comm.destroy_process_group()
