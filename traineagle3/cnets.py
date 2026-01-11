@@ -978,6 +978,8 @@ class Model(nn.Module):
 
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
+            print(inputs_embeds.shape, hidden_states.shape)
+
             layer_outputs, cache_hidden = self.midlayer(
                 input_emb=inputs_embeds,
                 hidden_states=hidden_states,

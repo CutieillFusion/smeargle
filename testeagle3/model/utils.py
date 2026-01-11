@@ -267,6 +267,11 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
         input_ids, past_key_values=past_key_values, output_orig=True
     )
 
+    print(f"outputs: {outputs}")
+    print(f"orig: {orig}")
+    print(f"hidden_states: {hidden_states}")
+    print(f"hidden_states.shape: {hidden_states.shape}")
+
     if logits_processor is not None:
         logits = orig[:, -1]
         logits = logits_processor(None, logits)

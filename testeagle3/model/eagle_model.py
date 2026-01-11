@@ -40,6 +40,7 @@ class EagleModel(nn.Module):
         )
 
         config = EConfig.from_pretrained(eagle_model_path)
+        print(config)
         with open(eagle_model_path, "r") as f:
             con = json.loads(f.read())
 
