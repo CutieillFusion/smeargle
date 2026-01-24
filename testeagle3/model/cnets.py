@@ -20,6 +20,8 @@
 """PyTorch LLaMA model."""
 import copy
 import os
+from safetensors import safe_open
+import json
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 import math
@@ -30,7 +32,6 @@ from torch import nn
 
 from transformers.activations import ACT2FN
 from huggingface_hub import hf_hub_download
-
 
 try:
     from .configs import EConfig
@@ -545,6 +546,7 @@ class LlamaDecoderLayeremb(nn.Module):
         hidden_states = self.hidden_norm(hidden_states)
         input_emb = self.input_layernorm(input_emb)
         
+        print(input_emb.shape, hidden_states.shape)
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
         
         # Self Attention
@@ -593,7 +595,6 @@ class Model(nn.Module):
     def __init__(
         self,
         config,
-        load_emb=False,
         path=None,
         bias=True,
         total_tokens=63,
@@ -613,41 +614,46 @@ class Model(nn.Module):
         self.lm_head = nn.Linear(
             config.hidden_size, config.draft_vocab_size, bias=False
         )
-        if load_emb and not hasattr(config, "target_hidden_size"):
-            from safetensors import safe_open
-            import json
 
-            try:
-                index_json_path = os.path.join(path, "model.safetensors.index.json")
-                if not os.path.exists(index_json_path):
-                    index_json_path = hf_hub_download(
-                        path, "model.safetensors.index.json"
-                    )
-                with open(index_json_path, "r") as f:
-                    index_json = json.loads(f.read())
-                    emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                local_emb_path = os.path.join(path, emb_path)
-                if not os.path.exists(local_emb_path):
-                    local_emb_path = hf_hub_download(path, emb_path)
-                with safe_open(local_emb_path, framework="pt", device="cpu") as f:
-                    tensor_slice = f.get_slice("model.embed_tokens.weight")
-                    vocab_size, hidden_dim = tensor_slice.get_shape()
-                    tensor = tensor_slice[:, :hidden_dim].float()
-            except:
-                index_json_path = os.path.join(path, "pytorch_model.bin.index.json")
-                if not os.path.exists(index_json_path):
-                    index_json_path = hf_hub_download(
-                        path, "pytorch_model.bin.index.json"
-                    )
-                with open(index_json_path, "r") as f:
-                    index_json = json.loads(f.read())
-                    emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                local_emb_path = os.path.join(path, emb_path)
-                if not os.path.exists(local_emb_path):
-                    local_emb_path = hf_hub_download(path, emb_path)
-                weights = torch.load(local_emb_path)
-                tensor = weights["model.embed_tokens.weight"].float()
-            self.embed_tokens.weight.data = tensor
+        try:
+            index_json_path = os.path.join(path, "model.safetensors.index.json")
+            if not os.path.exists(index_json_path):
+                index_json_path = hf_hub_download(
+                    path, "model.safetensors.index.json"
+                )
+
+            with open(index_json_path, "r") as f:
+                index_json = json.loads(f.read())
+                emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
+
+            local_emb_path = os.path.join(path, emb_path)
+            if not os.path.exists(local_emb_path):
+                local_emb_path = hf_hub_download(path, emb_path)
+
+            with safe_open(local_emb_path, framework="pt", device="cpu") as f:
+                tensor_slice = f.get_slice("model.embed_tokens.weight")
+                vocab_size, hidden_dim = tensor_slice.get_shape()
+                tensor = tensor_slice[:, :hidden_dim].float()
+        except:
+            index_json_path = os.path.join(path, "pytorch_model.bin.index.json")
+            if not os.path.exists(index_json_path):
+                index_json_path = hf_hub_download(
+                    path, "pytorch_model.bin.index.json"
+                )
+
+            with open(index_json_path, "r") as f:
+                index_json = json.loads(f.read())
+                emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
+
+            local_emb_path = os.path.join(path, emb_path)
+            if not os.path.exists(local_emb_path):
+                local_emb_path = hf_hub_download(path, emb_path)
+
+            weights = torch.load(local_emb_path)
+            tensor = weights["model.embed_tokens.weight"].float()
+
+        assert tensor is not None, "Embedding tensor is None"
+        self.embed_tokens.weight.data = tensor
 
         self.top_k = top_k
         self.total_tokens = total_tokens - 1
@@ -823,6 +829,9 @@ class Model(nn.Module):
         len_posi = input_ids.shape[1]
         self.reset()
 
+
+        print("hidden_states shape", hidden_states.shape)
+        print("input_ids shape", input_ids.shape)
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
             kv_len = self.stable_kv[0][0].shape[2]
             out_hidden, past_key_values = self(
@@ -835,6 +844,9 @@ class Model(nn.Module):
             out_hidden, past_key_values = self(
                 hidden_states, input_ids=input_ids, use_cache=True
             )
+        print("out_hidden shape", out_hidden.shape)
+        print("past_key_values shape", past_key_values[0][0].shape)
+        
         self.stable_kv = past_key_values
         last_hidden = out_hidden[:, -1]
 
@@ -859,6 +871,11 @@ class Model(nn.Module):
         for i in range(depth):
             self.tree_mask = tree_mask
             position_ids = len_posi + self.position_ids
+            print(f"before layer {i}") 
+            print(input_hidden.shape)
+            print(input_ids.shape)
+            print(past_key_values[0][0].shape)
+            print(position_ids)
             out_hidden, past_key_values = self(
                 input_hidden,
                 input_ids=input_ids,
@@ -866,6 +883,9 @@ class Model(nn.Module):
                 position_ids=position_ids,
                 use_cache=True,
             )
+            print(f"after layer {i}")
+            print(out_hidden.shape)
+            print(past_key_values[0][0].shape)
             len_posi += 1
 
             bias1 = top_k if i > 0 else 0

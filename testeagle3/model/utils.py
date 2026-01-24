@@ -267,11 +267,6 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
         input_ids, past_key_values=past_key_values, output_orig=True
     )
 
-    print(f"outputs: {outputs}")
-    print(f"orig: {orig}")
-    print(f"hidden_states: {hidden_states}")
-    print(f"hidden_states.shape: {hidden_states.shape}")
-
     if logits_processor is not None:
         logits = orig[:, -1]
         logits = logits_processor(None, logits)
@@ -287,6 +282,8 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
     if outputs["hidden_states"][0].device != ea_device:
         outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
     hidden_states = torch.cat(outputs["hidden_states"], dim=-1)
+    print(input_ids.shape)
+    print(hidden_states.shape)
     draft_tokens, retrieve_indices, tree_mask, tree_position_ids = (
         model.eagle_layer.topK_genrate(
             hidden_states, input_ids, model.base_model.lm_head, logits_processor

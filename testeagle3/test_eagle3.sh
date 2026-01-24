@@ -27,7 +27,8 @@ singularity exec --nv \
       --answer-file-path /workspace \
       --benchmark-path /datasets/mt_bench \
       --temperature 0.0 \
-      --depth 1 \
+      --top-k 2 \
+      --depth 7 \
       --warmup-steps 0 \
       --question-begin 0 \
       --question-end 1 \

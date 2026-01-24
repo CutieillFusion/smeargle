@@ -23,13 +23,11 @@ import json
 from typing import List, Optional, Tuple
 from collections import Counter
 import torch
-import torch.nn.functional as F
 from torch import nn
 import os
-from transformers.integrations.deepspeed import HfDeepSpeedConfig
 from transformers.activations import ACT2FN
 from transformers import AutoTokenizer
-from modeling_llama_kv import LlamaForCausalLM
+from modeling_llama import LlamaForCausalLM
 from configs import SmeargleConfig
 from safetensors import safe_open
 from datasets import load_dataset
@@ -41,7 +39,7 @@ from transformers.integrations import use_kernel_forward_from_hub
 class Mamba2(nn.Module):
     """MAMBA2 with cache support."""
 
-    def __init__(self, config):
+    def __init__(self, config: SmeargleConfig):
         super().__init__()
         self.config = config
         self.hidden_size = config.residual_size
@@ -70,7 +68,7 @@ class Mamba2(nn.Module):
 
 
 class LlamaMLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: SmeargleConfig):
         super().__init__()
         self.config = config
         self.hidden_size = config.residual_size
@@ -80,14 +78,14 @@ class LlamaMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
 
 @use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
         """
         LlamaRMSNorm is equivalent to T5LayerNorm
         """
@@ -95,7 +93,7 @@ class LlamaRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -107,7 +105,7 @@ class LlamaRMSNorm(nn.Module):
 
 
 class SmeargleDecoderLayeremb(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: SmeargleConfig):
         super().__init__()
         self.hidden_size = config.residual_size
         self.mamba2 = Mamba2(config=config)
@@ -163,7 +161,7 @@ class SmeargleDecoderLayeremb(nn.Module):
 
 
 @torch.no_grad()
-def padding(tensor, left=True):
+def padding(tensor: torch.Tensor, left: bool = True):
     zeropadding = torch.zeros_like(tensor[:, -1:])
     if left:
         tensor = torch.cat((zeropadding, tensor[:, :-1]), dim=1)
@@ -197,10 +195,9 @@ def merge_dicts(dicts):
 class Model(nn.Module):
     def __init__(
         self,
-        config,
-        training_config,
-        load_emb=True,
-        path=None,
+        config: SmeargleConfig,
+        training_config: dict,
+        path: str = None,
     ):
         super().__init__()
         self.train_config = training_config
@@ -213,39 +210,39 @@ class Model(nn.Module):
         self.draft_vocab_size = config.draft_vocab_size
         self.norm = LlamaRMSNorm(config.residual_size, eps=config.rms_norm_eps)
         self.length = 7
+
         # Lazy load target model to avoid OOM before DeepSpeed initialization
         self._target_model = None
         self._target_model_path = path
+
         self.fc = nn.Linear(self.hidden_size * 3, self.hidden_size, bias=False)
 
-        if not load_emb:
-            self.embed_tokens = nn.Embedding(
-                config.vocab_size, config.residual_size, self.padding_idx
-            )
+        try:
+            with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
+                index_json = json.loads(f.read())
+                emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
 
-        else:
-            try:
-                with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
-                    index_json = json.loads(f.read())
-                    emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                with safe_open(
-                    os.path.join(path, emb_path), framework="pt", device="cpu"
-                ) as f:
-                    tensor_slice = f.get_slice("model.embed_tokens.weight")
-                    vocab_size, hidden_dim = tensor_slice.get_shape()
-                    tensor = tensor_slice[:, :hidden_dim].float()
-            except:
-                with open(os.path.join(path, "pytorch_model.bin.index.json"), "r") as f:
-                    index_json = json.loads(f.read())
-                    emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                weights = torch.load(os.path.join(path, emb_path))
-                tensor = weights["model.embed_tokens.weight"].float()
-            self.embed_tokens = nn.Embedding(
-                config.vocab_size, config.residual_size, self.padding_idx, _weight=tensor
-            )
+            with safe_open(
+                os.path.join(path, emb_path), framework="pt", device="cpu"
+            ) as f:
+                tensor_slice = f.get_slice("model.embed_tokens.weight")
+                vocab_size, hidden_dim = tensor_slice.get_shape()
+                tensor = tensor_slice[:, :hidden_dim].float()
+        except:
+            with open(os.path.join(path, "pytorch_model.bin.index.json"), "r") as f:
+                index_json = json.loads(f.read())
+                emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
+
+            weights = torch.load(os.path.join(path, emb_path))
+            tensor = weights["model.embed_tokens.weight"].float()
+
+        assert tensor is not None, "Embedding tensor is None"
+        self.embed_tokens = nn.Embedding(
+            self.vocab_size, self.hidden_size, self.padding_idx, _weight=tensor
+        )
 
         self.lm_head = nn.Linear(
-            config.residual_size, config.draft_vocab_size, bias=False
+            self.hidden_size, self.draft_vocab_size, bias=False
         )
 
         for param in self.embed_tokens.parameters():
@@ -266,16 +263,18 @@ class Model(nn.Module):
                 param.requires_grad = False
         return self._target_model
 
-    def scandata(self, datapath, tokenizerpath, local_rank):
-        N = self.draft_vocab_size
-
-        if local_rank != 0 and not os.path.exists("cache.pt"):
+    def scandata(self, datapath: str, tokenizerpath: str, local_rank: int):
+        if os.path.exists("cache.pt"):
+            cache = torch.load("cache.pt")
+            d2t = cache["d2t"]
+            t2d = cache["t2d"]
+        elif local_rank != 0:         
             while not os.path.exists("cache.pt"):
                 time.sleep(1)
             cache = torch.load("cache.pt")
             d2t = cache["d2t"]
             t2d = cache["t2d"]
-        elif local_rank == 0 and not os.path.exists("cache.pt"):
+        elif local_rank == 0:
             tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
             dataset = load_dataset("json", data_files=datapath)
             dataset = dataset["train"]
@@ -385,46 +384,33 @@ class Model(nn.Module):
             token_dict = merge_dicts(results)
 
             total_frequency = sum(token_dict.values())
-            top_N = token_dict.most_common(N)
-            top_N_frequency_sum = sum(freq for key, freq in top_N)
-            top_N_ratio = top_N_frequency_sum / total_frequency
-            print(f"top {N} token frequency ratio: {top_N_ratio:.2%}")
-            used_tokens = [key for key, freq in top_N]
+            top_draft_tokens = token_dict.most_common(self.draft_vocab_size)
+            top_draft_tokens_frequency_sum = sum(freq for key, freq in top_draft_tokens)
+            top_draft_tokens_ratio = top_draft_tokens_frequency_sum / total_frequency
+            print(f"top {self.draft_vocab_size} token frequency ratio: {top_draft_tokens_ratio:.2%}")
+            used_tokens = [key for key, freq in top_draft_tokens]
             used_tokens.sort()
+
             d2t = [used_tokens[i] - i for i in range(len(used_tokens))]
             t2d = [i in used_tokens for i in range(self.vocab_size)]
+
             d2t = torch.tensor(d2t)
             t2d = torch.tensor(t2d)
+            
             cache = {"d2t": d2t, "t2d": t2d}
             torch.save(cache, "cache.pt")
-        else:
-            cache = torch.load("cache.pt")
-            d2t = cache["d2t"]
-            t2d = cache["t2d"]
- 
+
+        assert d2t is not None and d2t.sum() > 0, "d2t is all zeros"
+        assert t2d is not None and (~t2d).any(), "t2d does not contain any False values"
+
         self.register_buffer("d2t", d2t)
         self.register_buffer("t2d", t2d)
 
-        # Update draft_vocab_size to match actual computed size and fix lm_head if needed
         actual_draft_vocab_size = int(t2d.sum().item())
-        if actual_draft_vocab_size != self.draft_vocab_size:
-            print(
-                f"Warning: config draft_vocab_size ({self.draft_vocab_size}) != actual ({actual_draft_vocab_size}). Updating lm_head..."
-            )
-            self.draft_vocab_size = actual_draft_vocab_size
-            # Recreate lm_head with correct size
-            old_lm_head = self.lm_head
-            self.lm_head = nn.Linear(
-                old_lm_head.in_features, actual_draft_vocab_size, bias=False
-            )
-            # Initialize with existing weights if possible (first actual_draft_vocab_size outputs)
-            if old_lm_head.weight.shape[0] >= actual_draft_vocab_size:
-                self.lm_head.weight.data = old_lm_head.weight.data[
-                    :actual_draft_vocab_size
-                ].clone()
+        assert actual_draft_vocab_size == self.draft_vocab_size, f"actual draft_vocab_size ({actual_draft_vocab_size}) != draft_vocab_size ({self.draft_vocab_size})"
 
     @torch.no_grad()
-    def dataprepare(self, input_ids, attention_mask, loss_mask):
+    def dataprepare(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, loss_mask: torch.Tensor):
         device = input_ids.device
         target_model = self.target_model
         model_device = next(target_model.parameters()).device
@@ -432,12 +418,8 @@ class Model(nn.Module):
             target_model = target_model.to(device)
             self._target_model = target_model
         outs = target_model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states0 = outs.hidden_states[0]
-        hidden_states1 = outs.hidden_states[1]
-        hidden_states2 = outs.hidden_states[2]
-        hidden_states = torch.cat(
-            (hidden_states0, hidden_states1, hidden_states2), dim=-1
-        )
+        assert len(outs.hidden_states) == 3, "target model hidden states length is not 3"
+        hidden_states = torch.cat(outs.hidden_states, dim=-1)
         target = outs.logits
         target = padding(target, left=False)
         input_ids = padding(input_ids, left=False)
@@ -451,7 +433,7 @@ class Model(nn.Module):
 
     def forward(
         self,
-        input_ids,
+        input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         loss_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
@@ -537,10 +519,10 @@ class Model(nn.Module):
         return plosses, acces
 
 
-def count_parameters(model):
+def count_parameters(model: nn.Module):
     return sum(p.numel() for p in model.parameters())
 
-def print_model_summary(model):
+def print_model_summary(model: nn.Module):
     print(model)
 
 if __name__ == "__main__":
@@ -554,6 +536,6 @@ if __name__ == "__main__":
         "config_path": "config.json",
         "gradient_checkpoint": True,
     }
-    model = Model(config, training_config, load_emb=False)
+    model = Model(config, training_config, path="models/llama_3_1_8b_instruct")
     print(f"Number of parameters: {count_parameters(model):,}")
     print_model_summary(model)

@@ -1,24 +1,20 @@
 import argparse
 import json
+import time 
 import os
-from accelerate.utils import set_seed
-
-set_seed(0)
-
-import numpy as np
-import time
 import shortuuid
 import torch
 from fastchat.llm_judge.common import load_questions
 from tqdm import tqdm
-import scipy.stats as stats
-from model.eagle_model import EagleModel
+from model.smeargle_model import SmeargleModel
 from model.utils import prepare_logits_processor
+from accelerate.utils import set_seed
 
+set_seed(0)
 
 def run_eval(
     base_model_path: str,
-    eagle3_model_path: str,
+    smeargle_model_path: str,
     model_id: str,
     question_file: str,
     question_begin: int,
@@ -28,34 +24,33 @@ def run_eval(
     num_choices: int,
     num_gpus_per_model: int,
     num_gpus_total: int,
-    max_gpu_memory: str,
     temperature: float,
     total_token: int,
     depth: int,
     top_k: int,
     warmup_steps: int,
-    use_eagle3: bool,
+    use_smeargle: bool,
 ):
     questions = load_questions(question_file, question_begin, question_end)
 
     assert num_gpus_total % num_gpus_per_model == 0
 
     chunk_size = len(questions) // (num_gpus_total // num_gpus_per_model)
+    
     [
         get_model_answers(
             base_model_path,
-            eagle3_model_path,
+            smeargle_model_path,
             total_token,
             depth,
             top_k,
             warmup_steps,
-            use_eagle3,
+            use_smeargle,
             questions[i : i + chunk_size],
             answer_file,
             max_new_token,
             num_choices,
             num_gpus_per_model,
-            max_gpu_memory,
             model_id,
             temperature,
         )
@@ -66,25 +61,23 @@ def run_eval(
 @torch.inference_mode()
 def get_model_answers(
     base_model_path: str,
-    eagle3_model_path: str,
+    smeargle_model_path: str,
     total_token: int,
     depth: int,
     top_k: int,
     warmup_steps: int,
-    use_eagle3: bool,
+    use_smeargle: bool,
     questions: list[dict],
     answer_file: str,
     max_new_token: int,
     num_choices: int,
     num_gpus_per_model: int,
-    max_gpu_memory: str,
     model_id: str,
     temperature: float,
 ):
-
-    model = EagleModel.from_pretrained(
+    model = SmeargleModel.from_pretrained(
         base_model_path=base_model_path,
-        eagle_model_path=eagle3_model_path,
+        smeargle_model_path=smeargle_model_path,
         total_token=total_token,
         depth=depth,
         top_k=top_k,
@@ -92,20 +85,13 @@ def get_model_answers(
         low_cpu_mem_usage=True,
         device_map="auto",
     )
-
     tokenizer = model.get_tokenizer()
 
-    if temperature > 1e-5:
-        logits_processor = prepare_logits_processor(temperature=temperature)
-    else:
-        logits_processor = None
+    logits_processor = prepare_logits_processor(temperature=temperature) if temperature > 1e-5 else None
 
     model.eval()
 
-    generate = model.eaglegenerate if use_eagle3 else model.naivegenerate
-
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    print("CUDA VISIBLE DEVICES:", cuda_visible_devices)
+    generate = model.smearglegenerate if use_smeargle else model.naivegenerate
 
     warmup_question = questions[0]
     for _ in range(warmup_steps):
@@ -129,11 +115,9 @@ def get_model_answers(
                 [prompt],
                 add_special_tokens=False,
             ).input_ids
-            output_ids, new_token, idx, accept_length = generate(
+            output_ids = generate(
                 torch.as_tensor(input_ids).cuda(),
                 temperature=temperature,
-                log=True,
-                is_llama3=True,
             )
             torch.cuda.synchronize()
             output_ids = output_ids[0][len(input_ids[0]) :]
@@ -168,7 +152,6 @@ def get_model_answers(
             messages.append({"role": "assistant", "content": output})
     print("Warmup done")
 
-    global_acceptance_lengths = [0.0 for _ in range(depth + 2)]
     for question in tqdm(questions):
         choices = []
         for i in range(num_choices):
@@ -206,11 +189,9 @@ def get_model_answers(
                 torch.cuda.synchronize()
                 start_time = time.time()
 
-                output_ids, new_token, idx, accept_lengths = generate(
+                output_ids = generate(
                     torch.as_tensor(input_ids).cuda(),
                     temperature=temperature,
-                    log=True,
-                    is_llama3=True,
                 )
 
                 # End Timing Inference
@@ -248,84 +229,21 @@ def get_model_answers(
                 output = output.strip()
 
                 turns.append(output)
-                idxs.append(int(idx))
-                new_tokens.append(int(new_token))
+                # idxs.append(int(idx))
+                # new_tokens.append(int(new_token))
                 wall_time.append(total_time)
                 messages.append({"role": "assistant", "content": output})
 
-            if use_eagle3:
-                # Convert accept_lengths to CPU integers for processing
-                accept_lengths_int = [int(al) if hasattr(al, 'item') else int(al) for al in accept_lengths]
-                
-                # DIAGNOSTIC LOGGING: Track acceptance per position more accurately
-                max_accept_len = max(accept_lengths_int) if accept_lengths_int else 0
-                accept_length_per_position = [0.0 for _ in range(max_accept_len)]
-                
-                # Count how many times each position was proposed (denominator)
-                proposals_per_position = [0.0 for _ in range(max_accept_len)]
-                
-                for al in accept_lengths_int:
-                    # Each iteration proposes up to depth positions
-                    for pos_idx in range(min(depth + 1, max_accept_len)):
-                        proposals_per_position[pos_idx] += 1.0
-                    # Only positions up to accept_length were accepted
-                    for pos_idx in range(al):
-                        accept_length_per_position[pos_idx] += 1.0
-                
-                # Diagnostic: Print detailed stats for first choice of each question
-                if i == 0:
-                    print(f"\n=== DIAGNOSTIC: Acceptance Stats for Question {question['question_id']} ===")
-                    print(f"Total decoding iterations: {len(accept_lengths_int)}")
-                    print(f"Accept lengths distribution: {dict(zip(*np.unique(accept_lengths_int, return_counts=True)))}")
-                    print(f"Mean accept length: {np.mean(accept_lengths_int):.2f}")
-                    print(f"\nPer-position stats (true rate = accepted/proposed at each position):")
-                    for pos in range(min(8, max_accept_len)):  # Show first 8 positions
-                        proposed = proposals_per_position[pos] if pos < len(proposals_per_position) else 0
-                        accepted = accept_length_per_position[pos] if pos < len(accept_length_per_position) else 0
-                        rate = accepted / proposed if proposed > 0 else 0
-                        print(f"  Position {pos+1}: accepted={int(accepted)}, proposed={int(proposed)}, true_rate={rate:.3f}")
-                    print("=" * 60 + "\n")
-                
-                accuracy_per_position = [
-                    accept_length_per_position[pos_idx] / len(accept_lengths_int)
-                    for pos_idx in range(len(accept_length_per_position))
-                ]
-
-                for al in accept_lengths_int:
-                    global_acceptance_lengths[al] += 1.0
-
-                # Handle edge case where all accept_lengths are 0
-                if len(accuracy_per_position) > 0:
-                    alpha_per_position = [accuracy_per_position[0]] + [
-                        alpha / accuracy_per_position[idx] if accuracy_per_position[idx] > 0 else 0.0
-                        for idx, alpha in enumerate(accuracy_per_position[1:])
-                    ]
-                else:
-                    alpha_per_position = []
-
-            if use_eagle3:
-                choice_data = {
+            choices.append(
+                {
                     "index": i,
                     "turns": turns,
-                    "idxs": idxs,
-                    "new_tokens": new_tokens,
+                    "idxs": None,
+                    "new_tokens": None,
                     "wall_time": wall_time,
                 }
-                choice_data["accuracy_per_position"] = accuracy_per_position
-                choice_data["alpha_per_position"] = alpha_per_position
-                choice_data["mean_acceptance_length"] = np.mean(accept_lengths_int)
-                choices.append(choice_data)
-            else:
-                choices.append(
-                    {
-                        "index": i,
-                        "turns": turns,
-                        "idxs": idxs,
-                        "new_tokens": new_tokens,
-                        "wall_time": wall_time,
-                    }
-                )
-
+            )
+        
         # Dump answers
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
         with open(os.path.expanduser(answer_file), "a") as fout:
@@ -338,36 +256,11 @@ def get_model_answers(
             }
             fout.write(json.dumps(ans_json) + "\n")
 
-    if use_eagle3:
-        import matplotlib.pyplot as plt
-
-        # Calculate the overall acceptance rate per position
-        num_questions = len(choices)
-        if num_questions > 0:
-            global_acceptance_rate = [
-                x / num_questions for x in global_acceptance_lengths
-            ]
-
-            plt.figure(figsize=(8, 5))
-            plt.plot(
-                range(len(global_acceptance_rate)),
-                global_acceptance_rate,
-                marker="o",
-            )
-            plt.xlabel("Position")
-            plt.ylabel("Global Acceptance Rate")
-            plt.title("Global Acceptance Rate Per Position")
-            plt.grid(True)
-            # Save to answer file directory
-            chart_dir = os.path.dirname(answer_file)
-            plt.savefig(
-                os.path.join(chart_dir, "global_acceptance_rate_per_position.png")
-            )
-            plt.close()
-
-
 def reorg_answer_file(answer_file):
     """Sort by question id and de-duplication"""
+    if not os.path.exists(answer_file):
+        return
+
     answers = {}
     with open(answer_file, "r") as fin:
         for l in fin:
@@ -383,7 +276,7 @@ def reorg_answer_file(answer_file):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--eagle3-model-path",
+        "--smeargle-model-path",
         type=str,
         required=True,
         help="The path to the weights. This can be a local folder or a Hugging Face repo ID.",
@@ -457,11 +350,6 @@ if __name__ == "__main__":
         help="The number of warmup steps.",
     )
     parser.add_argument(
-        "--max-gpu-memory",
-        type=str,
-        help="Maxmum GPU memory used for model weights per GPU.",
-    )
-    parser.add_argument(
         "--temperature",
         type=float,
         default=0.0,
@@ -471,19 +359,19 @@ if __name__ == "__main__":
         type=str,
         default="mc_sim_7b_63",
     )
-    parser.add_argument("--use_eagle3", action="store_true")
+    parser.add_argument("--use_smeargle", action="store_true")
 
     args = parser.parse_args()
 
     question_file = f"{args.benchmark_path}/question.jsonl"
 
-    model_id = f"{args.base_model_path.split('/')[-1]}_{'eagle3' if args.use_eagle3 else 'baseline'}_temperature_{args.temperature}"
+    model_id = f"{args.base_model_path.split('/')[-1]}_{'smeargle' if args.use_smeargle else 'baseline'}_temperature_{args.temperature}"
 
     answer_file = f"{args.answer_file_path}/{model_id}.jsonl"
 
     run_eval(
         args.base_model_path,
-        args.eagle3_model_path,
+        args.smeargle_model_path,
         model_id,
         question_file,
         args.question_begin,
@@ -493,13 +381,12 @@ if __name__ == "__main__":
         args.num_choices,
         args.num_gpus_per_model,
         args.num_gpus_total,
-        args.max_gpu_memory,
         args.temperature,
         args.total_token,
         args.depth,
         args.top_k,
         args.warmup_steps,
-        args.use_eagle3,
+        args.use_smeargle,
     )
 
     reorg_answer_file(answer_file)

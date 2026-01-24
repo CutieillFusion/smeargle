@@ -39,7 +39,6 @@
         "reduce_bucket_size": 2e8,
         "contiguous_gradients": true
     },
-    "train_batch_size": 16,
     "train_micro_batch_size_per_gpu": 1,
     "gradient_accumulation_steps": 2,
     "gradient_clipping": 0.5,

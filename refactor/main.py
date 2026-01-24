@@ -204,7 +204,7 @@ testdataset = build_dataset_rank(tokenizer, args.testpath)
 
 config = SmeargleConfig.from_pretrained(train_config["config_path"])
 model = Model(
-    config, train_config, path=args.basepath, load_emb=True
+    config, train_config, path=args.basepath
 )
 model.scandata(args.trainpath, args.basepath, args.local_rank)
 
@@ -233,7 +233,6 @@ model_engine, optimizer, _, _ = deepspeed.initialize(
 )
 
 global_rank = deepspeed.comm.get_rank()
-rank = deepspeed.comm.get_local_rank()
 world_size = deepspeed.comm.get_world_size()
 
 args.savedir = f"models/{args.savedir}"
@@ -311,8 +310,7 @@ for epoch in range(start_epoch, num_epochs):
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
 
-    for batch_idx, data in enumerate(tqdm(train_loader)):
-
+    for data in tqdm(train_loader):
         model.zero_grad()
 
         device = next(model_engine.module.parameters()).device
@@ -341,7 +339,7 @@ for epoch in range(start_epoch, num_epochs):
     epoch_plosses = [[] for _ in range(model.length)]
 
     model.eval()
-    for batch_idx, data in enumerate(tqdm(test_loader)):
+    for data in tqdm(test_loader):
         with torch.no_grad():
             device = next(model_engine.module.parameters()).device
             plosses, acces = model_engine(

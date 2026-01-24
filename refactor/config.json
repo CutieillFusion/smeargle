@@ -1,6 +1,6 @@
 {
   "architectures": [
-    "Mamba2ForCausalLM"
+    "LlamaForCausalLM"
   ],
   "bos_token_id": 128000,
   "eos_token_id": 128001,

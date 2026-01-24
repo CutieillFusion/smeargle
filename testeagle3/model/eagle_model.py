@@ -40,7 +40,6 @@ class EagleModel(nn.Module):
         )
 
         config = EConfig.from_pretrained(eagle_model_path)
-        print(config)
         with open(eagle_model_path, "r") as f:
             con = json.loads(f.read())
 
@@ -57,7 +56,6 @@ class EagleModel(nn.Module):
             top_k=top_k,
             threshold=threshold,
             path=base_model_name_or_path,
-            load_emb=True,
         )
 
         low_memory = False
