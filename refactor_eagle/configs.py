@@ -1,6 +1,8 @@
 from transformers.configuration_utils import PretrainedConfig
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-class EConfig(PretrainedConfig):
+
+class EagleConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`LlamaModel`]. It is used to instantiate an LLaMA
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
@@ -49,6 +51,8 @@ class EConfig(PretrainedConfig):
             relevant if `config.is_decoder=True`.
         tie_word_embeddings(`bool`, *optional*, defaults to `False`):
             Whether to tie weight embeddings
+        rope_theta (`float`, *optional*, defaults to 10000.0):
+            The base period for RoPE (Rotary Position Embeddings). Llama 3.1 uses 500000.0.
         rope_scaling (`Dict`, *optional*):
             Dictionary containing the scaling configuration for the RoPE embeddings. Currently supports two scaling
             strategies: linear and dynamic. Their scaling factor must be an float greater than 1. The expected format
@@ -94,7 +98,12 @@ class EConfig(PretrainedConfig):
         eos_token_id=2,
         pretraining_tp=1,
         tie_word_embeddings=False,
+        rope_theta=10000.0,
         rope_scaling=None,
+        attention_dropout=0.0,
+        attention_bias=False,
+        mlp_bias=True,
+        attn_implementation="eager",
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -114,8 +123,14 @@ class EConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.pretraining_tp = pretraining_tp
         self.use_cache = use_cache
+        self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
         self._rope_scaling_validation()
+
+        self.attention_dropout = attention_dropout
+        self.attention_bias = attention_bias
+        self.mlp_bias = mlp_bias
+        self.attn_implementation = attn_implementation
 
         super().__init__(
             pad_token_id=pad_token_id,

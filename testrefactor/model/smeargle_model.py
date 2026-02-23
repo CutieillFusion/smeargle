@@ -9,6 +9,7 @@ from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 import os
+import numpy as np
 from transformers import PreTrainedModel, PretrainedConfig, AutoConfig
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.mamba2.modeling_mamba2 import Mamba2Cache
@@ -19,6 +20,29 @@ from .utils import *
 from .cnets import Model
 from .configs import SmeargleConfig
 
+class Timer:
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        torch.cuda.synchronize()
+        self.start = time.perf_counter()
+
+    def start(self):
+        torch.cuda.synchronize()
+        self.start = time.perf_counter()
+        return self
+
+    def stop(self):
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - self.start
+        print(f'{self.name} took {elapsed} seconds')
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - self.start
+        print(f'{self.name} took {elapsed} seconds')
 
 class SmeargleModel(nn.Module):
     def __init__(
@@ -153,23 +177,18 @@ class SmeargleModel(nn.Module):
         max_new_tokens=512,
         max_length=2048,
         use_cache: bool = True,
+        log: bool = False,
     ):
+        accept_lengths = []
         logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k) if temperature > 1e-5 else None
 
         input_len = input_ids.shape[1]
-
-        if use_cache:
-            # Use the model's dtype (for hidden states) instead of input_ids.dtype (which is long/int64)
-            model_dtype = self.base_model.dtype
-            cache_params = Mamba2Cache(self.smeargle_config, input_ids.shape[0], device=input_ids.device, dtype=model_dtype)
-            cache_position = torch.arange(0, input_len, device=input_ids.device, dtype=torch.long)
-        
         model_input = input_ids
+
         target_outputs = self.forward(
             model_input,
             use_cache=use_cache,
         )
-        target_past_key_values = target_outputs.past_key_values
 
         if logits_processor is not None:
             target_logits = target_outputs.logits[:, -1]
@@ -181,22 +200,30 @@ class SmeargleModel(nn.Module):
 
         if target_token_id.item() in [self.tokenizer.eos_token_id, self.stop_token_id]:
             return torch.cat([input_ids, target_token_id], dim=-1)
-        if input_ids.shape[1] - input_len > max_new_tokens or input_ids.shape[1] > max_length:
+        if input_ids.shape[1] - input_len >= max_new_tokens or input_ids.shape[1] >= max_length:
             return torch.cat([input_ids, target_token_id], dim=-1)
         
-        draft_input = model_input
+        input_ids = torch.cat([input_ids, target_token_id], dim=-1)
+        
+        if use_cache:
+            model_dtype = self.base_model.dtype
+            cache_params = Mamba2Cache(self.smeargle_config, input_ids.shape[0], device=input_ids.device, dtype=model_dtype)
+            cache_position = torch.arange(0, input_ids.shape[1], device=input_ids.device, dtype=torch.long)
+        
+        hidden_states = self.smeargle_layer.fc(torch.cat(target_outputs.hidden_states, dim=-1))
+
+        print("hidden_states shape: ", hidden_states.shape)
+
+        draft_input = input_ids[:, 1:]
         model_input = target_token_id
         for _ in range(max_length):
-            hidden_states = self.smeargle_layer.fc(torch.cat(target_outputs.hidden_states, dim=-1))
+            ssm_states_list = [cache_params.ssm_states.clone()]
+            conv_states_list = [cache_params.conv_states.clone()]
+            cache_position_list = [cache_position.clone()] # DEBUG
 
             for i in range(self.depth):
-                # print("hidden_states shape: ", hidden_states.shape)
-                # print("draft_input shape: ", draft_input.shape)
-                # print("draft_input: ", draft_input)
-                # print("model_input shape: ", model_input.shape)
-                # print("model_input: ", model_input)
-                # print("cache_params: ", cache_params if cache_params is not None else None)
-                # print("cache_position shape: ", cache_position.shape if cache_position is not None else None)
+                print(f"depth {i} cache_position: {cache_position}")
+                print("draft_input shape: ", draft_input.shape)
                 hidden_states, cache_params, cache_position = self.smeargle_layer(
                     hidden_states=hidden_states,
                     input_ids=draft_input,
@@ -204,6 +231,10 @@ class SmeargleModel(nn.Module):
                     cache_position=cache_position,
                 )
 
+                ssm_states_list.append(cache_params.ssm_states.clone())
+                conv_states_list.append(cache_params.conv_states.clone())
+                cache_position_list.append(cache_position.clone()) # DEBUG
+                
                 draft_outputs = self.smeargle_layer.lm_head(self.smeargle_layer.norm(hidden_states))
 
                 if logits_processor is not None:
@@ -221,10 +252,11 @@ class SmeargleModel(nn.Module):
                 model_input = torch.cat([model_input, draft_token_id], dim=-1)
                 draft_input = draft_token_id
 
-
+            cache_start = target_outputs.past_key_values.get_seq_length() if target_outputs.past_key_values is not None else 0
+            
             target_outputs = self.forward(
                 model_input,
-                past_key_values=target_past_key_values,
+                past_key_values=target_outputs.past_key_values,
                 use_cache=use_cache
             )
 
@@ -236,88 +268,75 @@ class SmeargleModel(nn.Module):
             else:
                 target_token_ids = target_outputs.logits[:, -(self.depth + 1):].argmax(dim=-1)
             
-
-            # print("target_token_ids: ", target_token_ids[:, :-1])
             posterior_mask = (
                 model_input[:, 1:] == target_token_ids[:, :-1]
             ).int()
-            # print("posterior_mask shape: ", torch.cumprod(posterior_mask, dim=1))
             accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1).max().item()
-            # print("posterior_mask: ", posterior_mask)
-            # print("accept_length: ", accept_length)
+            accept_lengths.append(accept_length)
             accepted_tokens = model_input[:, 1:1+accept_length]
-            prev_input_len = input_ids.shape[1]
+            print("accept_length: ", accept_length)
+            hidden_states = self.smeargle_layer.fc(torch.cat(target_outputs.hidden_states, dim=-1)[:, accept_length:accept_length+1])
 
             if accepted_tokens.shape[0] > 0:
                 input_ids = torch.cat([input_ids, accepted_tokens], dim=-1)
-            
-            if input_ids.shape[1] - input_len >= max_new_tokens or input_ids.shape[1] >= max_length:
-                return input_ids
-            
-            if use_cache and target_outputs.past_key_values is not None:
-                num_layers = len(target_outputs.past_key_values)
-                for layer_idx in range(num_layers):
-                    key_cache, value_cache = target_outputs.past_key_values[layer_idx]
-                    cache_seq_len = key_cache.shape[2]
-                    start_idx = max(0, prev_input_len - 1)
-                    end_idx = min(prev_input_len + accept_length + 1, cache_seq_len)
-                    
-                    if start_idx >= end_idx:
-                        continue
-                    
-                    select_indices = torch.arange(
-                        start_idx,
-                        end_idx,
-                        device=key_cache.device,
-                        dtype=torch.long
-                    )
-                    
-                    selected_keys = key_cache.index_select(2, select_indices)
-                    selected_values = value_cache.index_select(2, select_indices)
-                    
-                    target_outputs.past_key_values.layers[layer_idx].keys = selected_keys
-                    target_outputs.past_key_values.layers[layer_idx].values = selected_values
-                
-                target_past_key_values = target_outputs.past_key_values
-            
-            sample_logits = target_outputs.logits[:, accept_length]
+                        
+            sample_logits = target_outputs.logits[:, accept_length:accept_length+1]
             if logits_processor is not None:
-                sample_logits = logits_processor(input_ids, sample_logits.unsqueeze(1))
-                sample_logits = sample_logits.squeeze(1)
+                sample_logits = logits_processor(input_ids, sample_logits)
                 sample_p = torch.nn.functional.softmax(sample_logits, dim=-1)
                 target_token_id = torch.multinomial(sample_p, 1).squeeze(-1)
             else:
                 target_token_id = sample_logits.argmax(dim=-1)
-            
-            target_token_id_scalar = target_token_id[0] if target_token_id.dim() > 0 else target_token_id
-            
-            if target_token_id_scalar.item() in [self.tokenizer.eos_token_id, self.stop_token_id]:
-                if target_token_id.dim() == 0:
-                    target_token_id = target_token_id.unsqueeze(0)
-                target_token_id = target_token_id.unsqueeze(0) if target_token_id.dim() == 1 else target_token_id
-                return torch.cat([input_ids, target_token_id], dim=-1)
-            
-            if target_token_id.dim() == 0:
-                target_token_id = target_token_id.unsqueeze(0)
-            target_token_id = target_token_id.unsqueeze(0) if target_token_id.dim() == 1 else target_token_id
+
             model_input = target_token_id
             draft_input = target_token_id
-            
-            target_outputs = self.forward(
-                target_token_id,
-                past_key_values=target_past_key_values,
-                use_cache=use_cache
-            )
-            target_past_key_values = target_outputs.past_key_values
-            
-            if use_cache and cache_params is not None:
-                cache_params.reset()
-                cache_position = torch.arange(
-                    input_ids.shape[1] - 1,
-                    input_ids.shape[1],
-                    device=input_ids.device,
-                    dtype=torch.long
-                )
+
+            input_ids = torch.cat([input_ids, target_token_id], dim=-1)
+
+            if target_token_id.item() in [self.tokenizer.eos_token_id, self.stop_token_id]:
+                break
+
+            if input_ids.shape[1] - input_len >= max_new_tokens or input_ids.shape[1] >= max_length:
+                break
+
+            if use_cache:
+                if target_outputs.past_key_values is not None:
+                    num_layers = len(target_outputs.past_key_values)
+                    for layer_idx in range(num_layers):
+                        key_cache, value_cache = target_outputs.past_key_values[layer_idx]
+                        cache_seq_len = key_cache.shape[2]
+                        start_idx = 0
+                        end_idx = min(cache_start + accept_length + 1, cache_seq_len)
+                        
+                        select_indices = torch.arange(
+                            start_idx,
+                            end_idx,
+                            device=key_cache.device,
+                            dtype=torch.long
+                        )
+                        
+                        selected_keys = key_cache.index_select(2, select_indices)
+                        selected_values = value_cache.index_select(2, select_indices)
+                        
+                        target_outputs.past_key_values.layers[layer_idx].keys = selected_keys
+                        target_outputs.past_key_values.layers[layer_idx].values = selected_values
+                
+                if cache_params is not None:
+                    cache_params.ssm_states = ssm_states_list[accept_length]
+                    cache_params.conv_states = conv_states_list[accept_length]
+                    cache_position = torch.arange(cache_start + accept_length + 1, cache_start + accept_length + 2, device=input_ids.device, dtype=torch.long)
+
+            if input_ids.shape[1] > 150 and input_ids.shape[1] < 200:
+                print("Accept length:", accept_length)
+                print("Input ids shape:", input_ids.shape)
+                print("Number of past keys:", target_outputs.past_key_values[0][0].shape[2])
+                print("Cache position list:", cache_position_list[accept_length])
+                print("Cache position:", cache_position.item())
+
+        if not log:
+            return input_ids
+        else:
+            return input_ids, accept_lengths
 
     @torch.no_grad()
     def naivegenerate(
@@ -329,6 +348,7 @@ class SmeargleModel(nn.Module):
         max_new_tokens=512,
         max_length=2048,
         use_cache: bool = True,
+        log: bool = False,
     ):
         logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k) if temperature > 1e-5 else None
 
@@ -351,17 +371,20 @@ class SmeargleModel(nn.Module):
                 token_id = torch.multinomial(probabilities, 1)
             else:
                 token_id = outputs.logits[:, -1:].argmax(dim=-1)
-            
+
             input_ids = torch.cat([input_ids, token_id], dim=-1)
             model_input = token_id
             new_token += 1
             
             if token_id.item() in [self.tokenizer.eos_token_id, self.stop_token_id]:
                 break
-            if new_token > max_new_tokens or input_ids.shape[1] > max_length:
+            if new_token >= max_new_tokens or input_ids.shape[1] >= max_length:
                 break
         
-        return input_ids
+        if not log:
+            return input_ids
+        else:
+            return input_ids, [0]
 
     @torch.no_grad()
     def smeargle_generate(

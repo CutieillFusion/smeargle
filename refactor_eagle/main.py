@@ -5,7 +5,7 @@ import re
 import os
 import torch
 from cnets import Model
-from configs import SmeargleConfig
+from configs import EagleConfig
 from datasets import load_dataset
 from typing import Any, Dict, List
 from torch import optim
@@ -202,14 +202,14 @@ tokenizer = AutoTokenizer.from_pretrained(args.basepath)
 traindataset = build_dataset_rank(tokenizer, args.trainpath)
 testdataset = build_dataset_rank(tokenizer, args.testpath)
 
-config = SmeargleConfig.from_pretrained(train_config["config_path"])
+config = EagleConfig.from_pretrained(train_config["config_path"])
 model = Model(
     config, train_config, path=args.basepath
 )
 model.scandata(args.trainpath, args.basepath, args.local_rank)
 
 # Load target model before DeepSpeed init so all params are registered (fixes save_checkpoint)
-_ = model.target_model
+_ = model._target_model
 
 num_epochs = train_config["num_epochs"]
 

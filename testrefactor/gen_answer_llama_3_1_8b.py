@@ -150,7 +150,9 @@ def get_model_answers(
             output = output.strip()
 
             messages.append({"role": "assistant", "content": output})
-    print("Warmup done")
+    
+    if warmup_steps > 0:
+        print("Warmup done")
 
     for question in tqdm(questions):
         choices = []
@@ -166,6 +168,7 @@ def get_model_answers(
             idxs = []
             new_tokens = []
             wall_time = []
+            turn_token_ids = []
             for j in range(len(question["turns"])):
                 question_turn = question["turns"][j]
                 messages.append({"role": "user", "content": question_turn})
@@ -175,11 +178,6 @@ def get_model_answers(
                     add_generation_prompt=True,
                 )
 
-                prompt = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
                 input_ids = tokenizer(
                     [prompt],
                     add_special_tokens=False,
@@ -189,14 +187,17 @@ def get_model_answers(
                 torch.cuda.synchronize()
                 start_time = time.time()
 
-                output_ids = generate(
+                output_ids, acceptance_lengths = generate(
                     torch.as_tensor(input_ids).cuda(),
                     temperature=temperature,
+                    log=True,
                 )
 
                 # End Timing Inference
                 torch.cuda.synchronize()
                 total_time = time.time() - start_time
+
+                print("Mean acceptance length:", sum(acceptance_lengths)/len(acceptance_lengths) if acceptance_lengths else 0)
 
                 output_ids = output_ids[0][len(input_ids[0]) :]
 
@@ -229,17 +230,19 @@ def get_model_answers(
                 output = output.strip()
 
                 turns.append(output)
-                # idxs.append(int(idx))
-                # new_tokens.append(int(new_token))
+                idxs.append(len(input_ids[0]))
+                turn_token_ids.append(output_ids.tolist())
+                new_tokens.append(len(output_ids))
                 wall_time.append(total_time)
                 messages.append({"role": "assistant", "content": output})
 
             choices.append(
                 {
                     "index": i,
+                    "turn_token_ids": turn_token_ids,
                     "turns": turns,
-                    "idxs": None,
-                    "new_tokens": None,
+                    "idxs": idxs,
+                    "new_tokens": new_tokens,
                     "wall_time": wall_time,
                 }
             )
@@ -359,7 +362,7 @@ if __name__ == "__main__":
         type=str,
         default="mc_sim_7b_63",
     )
-    parser.add_argument("--use_smeargle", action="store_true")
+    parser.add_argument("--use-smeargle", action="store_true")
 
     args = parser.parse_args()
 

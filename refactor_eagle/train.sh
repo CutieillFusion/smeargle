@@ -9,7 +9,7 @@
 #SBATCH --mem=600G
 #SBATCH --account=undergrad_research
 
-cd /data/ai_club/smeargle/refactor
+cd /data/ai_club/smeargle/refactor_eagle
 
 SAVEDIR=${1:-$SLURM_JOB_ID}
 
@@ -20,7 +20,7 @@ SAVEDIR=${1:-$SLURM_JOB_ID}
 
 # Mount your project and use host's uv
 singularity exec --nv \
-  --bind /data/ai_club/smeargle/refactor:/workspace \
+  --bind /data/ai_club/smeargle/refactor_eagle:/workspace \
   --bind /data/ai_club/smeargle/datasets:/datasets \
   --bind /data/ai_club/smeargle/models:/models \
   --bind ~/.local/bin:/usr/local/bin \
@@ -37,6 +37,6 @@ singularity exec --nv \
       --basepath /models/llama_3_1_8b_instruct \
       --trainpath /datasets/train.jsonl \
       --testpath /datasets/test.jsonl \
-      --epochs 5 \
+      --epochs 40 \
       --savedir $SAVEDIR
   "
