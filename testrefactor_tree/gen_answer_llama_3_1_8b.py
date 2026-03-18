@@ -201,7 +201,7 @@ def get_model_answers(
                 print("Mean acceptance length:", sum(acceptance_lengths)/len(acceptance_lengths) if acceptance_lengths else 0)
                 print("Max acceptance length:", max(acceptance_lengths) if acceptance_lengths else 0)
                 print("Min acceptance length:", min(acceptance_lengths) if acceptance_lengths else 0)
-                print("Std acceptance length:", np.std(acceptance_lengths) if acceptance_lengths else 0)
+                print("Std acceptance length:", np.std([x.cpu() if hasattr(x, 'cpu') else x for x in acceptance_lengths]) if acceptance_lengths else 0)
 
                 output_ids = output_ids[0][len(input_ids[0]) :]
 

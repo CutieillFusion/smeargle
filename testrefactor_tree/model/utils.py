@@ -278,14 +278,14 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
     input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
 
     # Clone the output hidden states
-    ea_device = model.eagle_layer.lm_head.weight.device
+    ea_device = model.smeargle_layer.lm_head.weight.device
     if outputs["hidden_states"][0].device != ea_device:
         outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
     hidden_states = torch.cat(outputs["hidden_states"], dim=-1)
     # print("initialize_tree input_ids shape: ", input_ids.shape)
     # print("initialize_tree hidden_states shape: ", hidden_states.shape)
     draft_tokens, retrieve_indices, tree_mask, tree_position_ids = (
-        model.eagle_layer.topK_genrate(
+        model.smeargle_layer.topK_genrate(
             hidden_states, input_ids, model.base_model.lm_head, logits_processor
         )
     )
@@ -373,7 +373,7 @@ def tree_decoding(
         position_ids=position_ids,
     )
 
-    ea_device = model.eagle_layer.lm_head.weight.device
+    ea_device = model.smeargle_layer.lm_head.weight.device
     if outputs["hidden_states"][0].device != ea_device:
         outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
     hidden_state = torch.cat(outputs["hidden_states"], dim=-1)
@@ -522,7 +522,7 @@ def update_inference_inputs(
         token = token[None, None]
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
     draft_tokens, retrieve_indices, tree_mask, tree_position_ids = (
-        model.eagle_layer.topK_genrate(
+        model.smeargle_layer.topK_genrate(
             accept_hidden_state_new,
             input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
             head=model.base_model.lm_head,
