@@ -392,8 +392,8 @@ class SmeargleModel(nn.Module):
         temperature=0.0,
         top_p=0.0,
         top_k=0.0,
-        max_new_tokens=512,
-        max_length=2048,
+        max_new_tokens=8192,
+        max_length=128000,
         log=False,
         is_llama3=False,
     ):
@@ -503,8 +503,8 @@ class SmeargleModel(nn.Module):
         temperature=0.0,
         top_p=0.0,
         top_k=0.0,
-        max_new_tokens=512,
-        max_length=2048,
+        max_new_tokens=8192,
+        max_length=128000,
         log=False,
         is_llama3=False,
     ):

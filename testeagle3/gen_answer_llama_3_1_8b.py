@@ -5,6 +5,7 @@ from accelerate.utils import set_seed
 
 set_seed(0)
 
+import matplotlib.pyplot as plt
 import numpy as np
 import time
 import shortuuid
@@ -104,9 +105,6 @@ def get_model_answers(
 
     generate = model.eaglegenerate if use_eagle3 else model.naivegenerate
 
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    print("CUDA VISIBLE DEVICES:", cuda_visible_devices)
-
     warmup_question = questions[0]
     for _ in range(warmup_steps):
         torch.manual_seed(0)
@@ -169,6 +167,7 @@ def get_model_answers(
     print("Warmup done")
 
     global_acceptance_lengths = [0.0 for _ in range(depth + 2)]
+
     for question in tqdm(questions):
         choices = []
         for i in range(num_choices):
@@ -258,63 +257,48 @@ def get_model_answers(
                 accept_lengths_int = [int(al) if hasattr(al, 'item') else int(al) for al in accept_lengths]
                 
                 # DIAGNOSTIC LOGGING: Track acceptance per position more accurately
-                max_accept_len = max(accept_lengths_int) if accept_lengths_int else 0
-                accept_length_per_position = [0.0 for _ in range(max_accept_len)]
+                # max_accept_len = max(accept_lengths_int) if accept_lengths_int else 0
+                # accept_length_per_position = [0.0 for _ in range(max_accept_len)]
                 
-                # Count how many times each position was proposed (denominator)
-                proposals_per_position = [0.0 for _ in range(max_accept_len)]
+                # # Count how many times each position was proposed (denominator)
+                # proposals_per_position = [0.0 for _ in range(max_accept_len)]
                 
-                for al in accept_lengths_int:
-                    # Each iteration proposes up to depth positions
-                    for pos_idx in range(min(depth + 1, max_accept_len)):
-                        proposals_per_position[pos_idx] += 1.0
-                    # Only positions up to accept_length were accepted
-                    for pos_idx in range(al):
-                        accept_length_per_position[pos_idx] += 1.0
+                # for al in accept_lengths_int:
+                #     # Each iteration proposes up to depth positions
+                #     for pos_idx in range(min(depth + 1, max_accept_len)):
+                #         proposals_per_position[pos_idx] += 1.0
+                #     # Only positions up to accept_length were accepted
+                #     for pos_idx in range(al):
+                #         accept_length_per_position[pos_idx] += 1.0
                 
-                # Diagnostic: Print detailed stats for first choice of each question
-                if i == 0:
-                    print(f"\n=== DIAGNOSTIC: Acceptance Stats for Question {question['question_id']} ===")
-                    print(f"Total decoding iterations: {len(accept_lengths_int)}")
-                    print(f"Accept lengths distribution: {dict(zip(*np.unique(accept_lengths_int, return_counts=True)))}")
-                    print(f"Mean accept length: {np.mean(accept_lengths_int):.2f}")
-                    print(f"\nPer-position stats (true rate = accepted/proposed at each position):")
-                    for pos in range(min(8, max_accept_len)):  # Show first 8 positions
-                        proposed = proposals_per_position[pos] if pos < len(proposals_per_position) else 0
-                        accepted = accept_length_per_position[pos] if pos < len(accept_length_per_position) else 0
-                        rate = accepted / proposed if proposed > 0 else 0
-                        print(f"  Position {pos+1}: accepted={int(accepted)}, proposed={int(proposed)}, true_rate={rate:.3f}")
-                    print("=" * 60 + "\n")
+                # # Diagnostic: Print detailed stats for first choice of each question
+                # if i == 0:
+                #     print(f"\n=== DIAGNOSTIC: Acceptance Stats for Question {question['question_id']} ===")
+                #     print(f"Total decoding iterations: {len(accept_lengths_int)}")
+                #     print(f"Accept lengths distribution: {dict(zip(*np.unique(accept_lengths_int, return_counts=True)))}")
+                #     print(f"Mean accept length: {np.mean(accept_lengths_int):.2f}")
+                #     print(f"\nPer-position stats (true rate = accepted/proposed at each position):")
+                #     for pos in range(min(8, max_accept_len)):  # Show first 8 positions
+                #         proposed = proposals_per_position[pos] if pos < len(proposals_per_position) else 0
+                #         accepted = accept_length_per_position[pos] if pos < len(accept_length_per_position) else 0
+                #         rate = accepted / proposed if proposed > 0 else 0
+                #         print(f"  Position {pos+1}: accepted={int(accepted)}, proposed={int(proposed)}, true_rate={rate:.3f}")
+                #     print("=" * 60 + "\n")
                 
-                accuracy_per_position = [
-                    accept_length_per_position[pos_idx] / len(accept_lengths_int)
-                    for pos_idx in range(len(accept_length_per_position))
-                ]
-
                 for al in accept_lengths_int:
                     global_acceptance_lengths[al] += 1.0
 
-                # Handle edge case where all accept_lengths are 0
-                if len(accuracy_per_position) > 0:
-                    alpha_per_position = [accuracy_per_position[0]] + [
-                        alpha / accuracy_per_position[idx] if accuracy_per_position[idx] > 0 else 0.0
-                        for idx, alpha in enumerate(accuracy_per_position[1:])
-                    ]
-                else:
-                    alpha_per_position = []
+                # print("global_acceptance_lengths:", global_acceptance_lengths)
 
             if use_eagle3:
-                choice_data = {
+                choices.append({
                     "index": i,
                     "turns": turns,
                     "idxs": idxs,
                     "new_tokens": new_tokens,
                     "wall_time": wall_time,
-                }
-                choice_data["accuracy_per_position"] = accuracy_per_position
-                choice_data["alpha_per_position"] = alpha_per_position
-                choice_data["mean_acceptance_length"] = np.mean(accept_lengths_int)
-                choices.append(choice_data)
+                    "acceptance_lengths": dict(zip(*[a.tolist() for a in np.unique(accept_lengths_int, return_counts=True)])),
+                })
             else:
                 choices.append(
                     {
@@ -339,31 +323,26 @@ def get_model_answers(
             fout.write(json.dumps(ans_json) + "\n")
 
     if use_eagle3:
-        import matplotlib.pyplot as plt
-
-        # Calculate the overall acceptance rate per position
-        num_questions = len(choices)
-        if num_questions > 0:
-            global_acceptance_rate = [
-                x / num_questions for x in global_acceptance_lengths
-            ]
-
-            plt.figure(figsize=(8, 5))
-            plt.plot(
-                range(len(global_acceptance_rate)),
-                global_acceptance_rate,
-                marker="o",
-            )
-            plt.xlabel("Position")
-            plt.ylabel("Global Acceptance Rate")
-            plt.title("Global Acceptance Rate Per Position")
-            plt.grid(True)
-            # Save to answer file directory
-            chart_dir = os.path.dirname(answer_file)
-            plt.savefig(
-                os.path.join(chart_dir, "global_acceptance_rate_per_position.png")
-            )
-            plt.close()
+        # Reverse cumulative sum: position k shows count of acceptance lengths >= k
+        cumulative = np.cumsum(np.array(global_acceptance_lengths)[::-1])[::-1]
+        cumulative = cumulative / cumulative[0]
+        plt.figure(figsize=(8, 5))
+        plt.plot(
+            range(len(cumulative)),
+            cumulative,
+            marker="o",
+        )
+        plt.xlabel("Position")
+        plt.ylabel("Acceptance Rate")
+        plt.title("Acceptance Rate Per Position")
+        plt.ylim(0, 1.05)
+        plt.grid(True)
+        # Save to answer file directory
+        chart_dir = os.path.dirname(answer_file)
+        plt.savefig(
+            os.path.join(chart_dir, "acceptance_rate_per_position.png")
+        )
+        plt.close()
 
 
 def reorg_answer_file(answer_file):

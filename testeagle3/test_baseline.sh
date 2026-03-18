@@ -22,10 +22,9 @@ singularity exec --nv \
     export CUDA_HOME=/usr/local/cuda && \
     export PATH=\$CUDA_HOME/bin:\$PATH && \
     .venv/bin/python gen_answer_llama_3_1_8b.py \
-      --eagle3-model-path /models/eagle3_llama_3_1_8b_instruct \
+      --eagle3-model-path /models/eagle3_3_1_8b_instruct_10_epoch \
       --base-model-path /models/llama_3_1_8b_instruct \
       --answer-file-path /workspace \
-      --benchmark-path /datasets/mt_bench \
+      --benchmark-path /datasets/spec_bench \
       --temperature 0.0 \
-      --question-begin 0 \
-      --question-end 1"
+      --warmup-steps 3"

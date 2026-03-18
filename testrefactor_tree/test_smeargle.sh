@@ -25,10 +25,8 @@ singularity exec --nv \
       --smeargle-model-path /models/smeargle_3_1_8b_instruct_10_epoch \
       --base-model-path /models/llama_3_1_8b_instruct \
       --answer-file-path /workspace \
-      --benchmark-path /datasets/spec_bench \
+      --benchmark-path /datasets/wiki_long \
       --temperature 0.0 \
-      --depth 7 \
+      --depth 5 \
       --warmup-steps 3 \
-      --question-begin 0 \
-      --question-end 2 \
       --use-smeargle"

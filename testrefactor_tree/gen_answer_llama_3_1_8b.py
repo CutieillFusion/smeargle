@@ -1,3 +1,4 @@
+import matplotlib.pyplot as plt
 import argparse
 import json
 import time 
@@ -155,6 +156,8 @@ def get_model_answers(
     if warmup_steps > 0:
         print("Warmup done")
 
+    global_acceptance_lengths = [0.0 for _ in range(depth + 2)]
+
     for question in tqdm(questions):
         choices = []
         for i in range(num_choices):
@@ -169,7 +172,6 @@ def get_model_answers(
             idxs = []
             new_tokens = []
             wall_time = []
-            turn_token_ids = []
             for j in range(len(question["turns"])):
                 question_turn = question["turns"][j]
                 messages.append({"role": "user", "content": question_turn})
@@ -197,11 +199,6 @@ def get_model_answers(
                 # End Timing Inference
                 torch.cuda.synchronize()
                 total_time = time.time() - start_time
-
-                print("Mean acceptance length:", sum(acceptance_lengths)/len(acceptance_lengths) if acceptance_lengths else 0)
-                print("Max acceptance length:", max(acceptance_lengths) if acceptance_lengths else 0)
-                print("Min acceptance length:", min(acceptance_lengths) if acceptance_lengths else 0)
-                print("Std acceptance length:", np.std([x.cpu() if hasattr(x, 'cpu') else x for x in acceptance_lengths]) if acceptance_lengths else 0)
 
                 output_ids = output_ids[0][len(input_ids[0]) :]
 
@@ -235,22 +232,68 @@ def get_model_answers(
 
                 turns.append(output)
                 idxs.append(len(input_ids[0]))
-                turn_token_ids.append(output_ids.tolist())
                 new_tokens.append(len(output_ids))
                 wall_time.append(total_time)
                 messages.append({"role": "assistant", "content": output})
 
-            choices.append(
-                {
+            if use_smeargle:
+                # Convert accept_lengths to CPU integers for processing
+                accept_lengths_int = [int(al) if hasattr(al, 'item') else int(al) for al in acceptance_lengths]
+
+                # # DIAGNOSTIC LOGGING: Track acceptance per position more accurately
+                # max_accept_len = max(accept_lengths_int) if accept_lengths_int else 0
+                # accept_length_per_position = [0.0 for _ in range(max_accept_len)]
+
+                # # Count how many times each position was proposed (denominator)
+                # proposals_per_position = [0.0 for _ in range(max_accept_len)]
+
+                # for al in accept_lengths_int:
+                #     # Each iteration proposes up to depth positions
+                #     for pos_idx in range(min(depth + 1, max_accept_len)):
+                #         proposals_per_position[pos_idx] += 1.0
+                #     # Only positions up to accept_length were accepted
+                #     for pos_idx in range(al):
+                #         accept_length_per_position[pos_idx] += 1.0
+
+                # # Diagnostic: Print detailed stats for first choice of each question
+                # if i == 0:
+                #     print(f"\n=== DIAGNOSTIC: Acceptance Stats for Question {question['question_id']} ===")
+                #     print(f"Total decoding iterations: {len(accept_lengths_int)}")
+                #     print(f"Accept lengths distribution: {dict(zip(*np.unique(accept_lengths_int, return_counts=True)))}")
+                #     print(f"Mean accept length: {np.mean(accept_lengths_int):.2f}")
+                #     print(f"\nPer-position stats (true rate = accepted/proposed at each position):")
+                #     for pos in range(min(8, max_accept_len)):  # Show first 8 positions
+                #         proposed = proposals_per_position[pos] if pos < len(proposals_per_position) else 0
+                #         accepted = accept_length_per_position[pos] if pos < len(accept_length_per_position) else 0
+                #         rate = accepted / proposed if proposed > 0 else 0
+                #         print(f"  Position {pos+1}: accepted={int(accepted)}, proposed={int(proposed)}, true_rate={rate:.3f}")
+                #     print("=" * 60 + "\n")
+
+                for al in accept_lengths_int:
+                    global_acceptance_lengths[al] += 1.0
+
+                # print("global_acceptance_lengths:", global_acceptance_lengths)
+
+            if use_smeargle:
+                choices.append({
                     "index": i,
-                    "turn_token_ids": turn_token_ids,
                     "turns": turns,
                     "idxs": idxs,
                     "new_tokens": new_tokens,
                     "wall_time": wall_time,
-                }
-            )
-        
+                    "acceptance_lengths": dict(zip(*[a.tolist() for a in np.unique(accept_lengths_int, return_counts=True)])),
+                })
+            else:
+                choices.append(
+                    {
+                        "index": i,
+                        "turns": turns,
+                        "idxs": idxs,
+                        "new_tokens": new_tokens,
+                        "wall_time": wall_time,
+                    }
+                )
+
         # Dump answers
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
         with open(os.path.expanduser(answer_file), "a") as fout:
@@ -262,6 +305,29 @@ def get_model_answers(
                 "tstamp": time.time(),
             }
             fout.write(json.dumps(ans_json) + "\n")
+
+    if use_smeargle:
+
+        # Reverse cumulative sum: position k shows count of acceptance lengths >= k
+        cumulative = np.cumsum(np.array(global_acceptance_lengths)[::-1])[::-1]
+        cumulative = cumulative / cumulative[0]
+        plt.figure(figsize=(8, 5))
+        plt.plot(
+            range(len(cumulative)),
+            cumulative,
+            marker="o",
+        )
+        plt.xlabel("Position")
+        plt.ylabel("Acceptance Rate")
+        plt.title("Acceptance Rate Per Position")
+        plt.ylim(0, 1.05)
+        plt.grid(True)
+        # Save to answer file directory
+        chart_dir = os.path.dirname(answer_file)
+        plt.savefig(
+            os.path.join(chart_dir, "acceptance_rate_per_position.png")
+        )
+        plt.close()
 
 def reorg_answer_file(answer_file):
     """Sort by question id and de-duplication"""
