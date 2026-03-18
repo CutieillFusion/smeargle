@@ -406,8 +406,8 @@ class EagleModel(nn.Module):
         temperature=0.0,
         top_p=0.0,
         top_k=0.0,
-        max_new_tokens=2048,
-        max_length=16384,
+        max_new_tokens=8192,
+        max_length=128000,
         log=False,
         is_llama3=False,
     ):
@@ -517,8 +517,8 @@ class EagleModel(nn.Module):
         temperature=0.0,
         top_p=0.0,
         top_k=0.0,
-        max_new_tokens=2048,
-        max_length=16384,
+        max_new_tokens=8192,
+        max_length=128000,
         log=False,
         is_llama3=False,
     ):

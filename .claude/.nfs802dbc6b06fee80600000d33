@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:aclanthology.org)",
+      "WebFetch(domain:goombalab.github.io)",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:www.lighton.ai)",
+      "Bash(ls:*)",
+      "Bash(find /data/ai_club/smeargle -name *generate* -o -name *infer*)",
+      "Bash(grep -E \"\\\\.\\(py|pyi\\)$\")",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(grep -r \"SmeargleModel\\\\|class.*Model\" /data/ai_club/smeargle/testrefactor_tree/model/*.py)",
+      "Bash(find /data/ai_club/smeargle -maxdepth 2 -name *.py -not -path */.venv/*)",
+      "Bash(find /data/ai_club/smeargle -maxdepth 2 -name *gen* -o -name *test*.py -o -name *inference*)",
+      "Bash(uv run:*)",
+      "Bash(jq -s \".[] | select\\(.category == \"\"qa\"\"\\) | {question_id, category, turns}\" /data/ai_club/smeargle/datasets/spec_bench/question.jsonl)"
+    ]
+  }
+}
