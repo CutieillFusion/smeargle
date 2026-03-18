@@ -107,7 +107,7 @@ class SmeargleConfig(PretrainedConfig):
         head_dim=64,
         vocab_size=32000,
         hidden_size=4096,
-        state_size=128,
+        state_size=256,
         num_hidden_layers=1,
         rms_norm_eps=1e-5,
         pad_token_id=1,
@@ -115,7 +115,7 @@ class SmeargleConfig(PretrainedConfig):
         eos_token_id=2,
         expand=2,
         conv_kernel=4,
-        n_groups=8,
+        n_groups=1,
         use_bias=False,
         use_conv_bias=True,
         hidden_act="silu",
@@ -166,7 +166,6 @@ class SmeargleConfig(PretrainedConfig):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.rms_norm = True
-        self.state_size = state_size
         self.chunk_size = chunk_size
         self.time_step_limit = time_step_limit
         self.tie_word_embeddings = tie_word_embeddings

@@ -1,13 +1,13 @@
 import argparse
 import json
-import time 
+import time
 import os
 import numpy as np
 import shortuuid
 import torch
 from fastchat.llm_judge.common import load_questions
 from tqdm import tqdm
-from model.smeargle_model import SmeargleModel
+from model.eagle_model import EagleModel
 from model.utils import prepare_logits_processor
 from accelerate.utils import set_seed
 
@@ -15,7 +15,7 @@ set_seed(0)
 
 def run_eval(
     base_model_path: str,
-    smeargle_model_path: str,
+    eagle_model_path: str,
     model_id: str,
     question_file: str,
     question_begin: int,
@@ -30,23 +30,23 @@ def run_eval(
     depth: int,
     top_k: int,
     warmup_steps: int,
-    use_smeargle: bool,
+    use_eagle: bool,
 ):
     questions = load_questions(question_file, question_begin, question_end)
 
     assert num_gpus_total % num_gpus_per_model == 0
 
     chunk_size = len(questions) // (num_gpus_total // num_gpus_per_model)
-    
+
     [
         get_model_answers(
             base_model_path,
-            smeargle_model_path,
+            eagle_model_path,
             total_token,
             depth,
             top_k,
             warmup_steps,
-            use_smeargle,
+            use_eagle,
             questions[i : i + chunk_size],
             answer_file,
             max_new_token,
@@ -62,12 +62,12 @@ def run_eval(
 @torch.inference_mode()
 def get_model_answers(
     base_model_path: str,
-    smeargle_model_path: str,
+    eagle_model_path: str,
     total_token: int,
     depth: int,
     top_k: int,
     warmup_steps: int,
-    use_smeargle: bool,
+    use_eagle: bool,
     questions: list[dict],
     answer_file: str,
     max_new_token: int,
@@ -76,9 +76,9 @@ def get_model_answers(
     model_id: str,
     temperature: float,
 ):
-    model = SmeargleModel.from_pretrained(
+    model = EagleModel.from_pretrained(
         base_model_path=base_model_path,
-        smeargle_model_path=smeargle_model_path,
+        eagle_model_path=eagle_model_path,
         total_token=total_token,
         depth=depth,
         top_k=top_k,
@@ -92,7 +92,7 @@ def get_model_answers(
 
     model.eval()
 
-    generate = model.smearglegenerate if use_smeargle else model.naivegenerate
+    generate = model.eaglegenerate if use_eagle else model.naivegenerate
 
     warmup_question = questions[0]
     for _ in range(warmup_steps):
@@ -123,7 +123,6 @@ def get_model_answers(
             torch.cuda.synchronize()
             output_ids = output_ids[0][len(input_ids[0]) :]
 
-            # To be consistent with the template's stop_token_ids
             stop_token_ids = [
                 tokenizer.eos_token_id,
                 tokenizer.convert_tokens_to_ids("<|eot_id|>"),
@@ -140,8 +139,6 @@ def get_model_answers(
                 spaces_between_special_tokens=False,
             )
 
-            # Remove Special Tokens
-            # "<|begin_of_text|>Here is the answer to your question.<|end_of_text|>" -> "Here is the answer to your question."
             for special_token in tokenizer.special_tokens_map.values():
                 if isinstance(special_token, list):
                     for special_tok in special_token:
@@ -151,7 +148,7 @@ def get_model_answers(
             output = output.strip()
 
             messages.append({"role": "assistant", "content": output})
-    
+
     if warmup_steps > 0:
         print("Warmup done")
 
@@ -205,7 +202,6 @@ def get_model_answers(
 
                 output_ids = output_ids[0][len(input_ids[0]) :]
 
-                # To be consistent with the template's stop_token_ids
                 stop_token_ids = [
                     tokenizer.eos_token_id,
                     tokenizer.convert_tokens_to_ids("<|eot_id|>"),
@@ -223,8 +219,6 @@ def get_model_answers(
                     spaces_between_special_tokens=False,
                 )
 
-                # Remove Special Tokens
-                # "<|begin_of_text|>Here is the answer to your question.<|end_of_text|>" -> "Here is the answer to your question."
                 for special_token in tokenizer.special_tokens_map.values():
                     if isinstance(special_token, list):
                         for special_tok in special_token:
@@ -250,7 +244,7 @@ def get_model_answers(
                     "wall_time": wall_time,
                 }
             )
-        
+
         # Dump answers
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
         with open(os.path.expanduser(answer_file), "a") as fout:
@@ -283,7 +277,7 @@ def reorg_answer_file(answer_file):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--smeargle-model-path",
+        "--eagle-model-path",
         type=str,
         required=True,
         help="The path to the weights. This can be a local folder or a Hugging Face repo ID.",
@@ -361,24 +355,19 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
     )
-    parser.add_argument(
-        "--tree-choices",
-        type=str,
-        default="mc_sim_7b_63",
-    )
-    parser.add_argument("--use-smeargle", action="store_true")
+    parser.add_argument("--use-eagle", action="store_true")
 
     args = parser.parse_args()
 
     question_file = f"{args.benchmark_path}/question.jsonl"
 
-    model_id = f"{args.base_model_path.split('/')[-1]}_{'smeargle' if args.use_smeargle else 'baseline'}_temperature_{args.temperature}"
+    model_id = f"{args.base_model_path.split('/')[-1]}_{'eagle' if args.use_eagle else 'baseline'}_temperature_{args.temperature}"
 
     answer_file = f"{args.answer_file_path}/{model_id}.jsonl"
 
     run_eval(
         args.base_model_path,
-        args.smeargle_model_path,
+        args.eagle_model_path,
         model_id,
         question_file,
         args.question_begin,
@@ -393,7 +382,7 @@ if __name__ == "__main__":
         args.depth,
         args.top_k,
         args.warmup_steps,
-        args.use_smeargle,
+        args.use_eagle,
     )
 
     reorg_answer_file(answer_file)
