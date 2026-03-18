@@ -209,7 +209,7 @@ model = Model(
 model.scandata(args.trainpath, args.basepath, args.local_rank)
 
 # Load target model before DeepSpeed init so all params are registered (fixes save_checkpoint)
-_ = model.target_model
+_ = model._target_model
 
 num_epochs = train_config["num_epochs"]
 

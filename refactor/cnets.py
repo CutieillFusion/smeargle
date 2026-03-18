@@ -219,7 +219,7 @@ class Model(nn.Module):
             param.requires_grad = False
 
         self.fc = nn.Linear(self.hidden_size * 3, self.hidden_size, bias=False)
-        self.smooth_l1 = nn.SmoothL1Loss(reduction="none")
+
 
         try:
             with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
@@ -491,13 +491,6 @@ class Model(nn.Module):
             sum_logit = torch.sum(position_mask * plogp, 2)
             loss = -sum_logit.mean()
 
-            student_p = nn.Softmax(dim=2)(logits)
-            smooth_l1_per_elem = self.smooth_l1(student_p, target_p)
-            smooth_l1_per_pos = smooth_l1_per_elem.mean(dim=2)
-            smooth_l1_masked = (position_mask.squeeze(-1) * smooth_l1_per_pos).sum() / (position_mask.sum() + 1e-6)
-            
-            loss = loss + 0.1 * smooth_l1_masked
-
             plosses.append(loss)
 
             if len(acces) == 0 or acces[-1] > 0:
@@ -535,6 +528,6 @@ if __name__ == "__main__":
         "config_path": "config.json",
         "gradient_checkpoint": True,
     }
-    model = Model(config, training_config, path="models/llama_3_1_8b_instruct")
+    model = Model(config, training_config, path="/models/llama_3_1_8b_instruct")
     print(f"Number of parameters: {count_parameters(model):,}")
     print_model_summary(model)

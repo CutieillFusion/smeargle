@@ -20,10 +20,10 @@
   "use_cache": true,
   "vocab_size": 128256,
   "draft_vocab_size": 32000,
-  "state_size": 128,
+  "state_size": 32,
   "chunk_size": 256,
   "conv_kernel": 4,
   "expand": 2,
-  "n_groups": 8,
+  "n_groups": 1,
   "residual_in_fp32": true
 }

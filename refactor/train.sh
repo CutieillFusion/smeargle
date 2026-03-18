@@ -4,7 +4,7 @@
 #SBATCH --error=models/%j/train_refactor.err
 #SBATCH --partition=dgxh100
 #SBATCH --time=14-00:00:00
-#SBATCH --gres=gpu:6
+#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=600G
 #SBATCH --account=undergrad_research
@@ -37,6 +37,6 @@ singularity exec --nv \
       --basepath /models/llama_3_1_8b_instruct \
       --trainpath /datasets/train.jsonl \
       --testpath /datasets/test.jsonl \
-      --epochs 5 \
+      --epochs 40 \
       --savedir $SAVEDIR
   "

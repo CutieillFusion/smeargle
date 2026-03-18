@@ -9,7 +9,7 @@
         "type": "AdamW",
         "params": {
             "lr": 0,
-            "weight_decay": 0.0,
+            "weight_decay": 0.1,
             "adam_w_mode": true,
             "betas": [
                 0.9,
@@ -38,7 +38,7 @@
     },
     "train_micro_batch_size_per_gpu": 1,
     "gradient_accumulation_steps": 2,
-    "gradient_clipping": 0.5,
+    "gradient_clipping": 1.0,
     "steps_per_print": 2000,
     "wall_clock_breakdown": false
 }

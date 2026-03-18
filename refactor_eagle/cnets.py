@@ -782,6 +782,6 @@ if __name__ == "__main__":
         "config_path": "config.json",
         "gradient_checkpoint": True,
     }
-    model = Model(config, training_config, path="models/llama_3_1_8b_instruct")
+    model = Model(config, training_config, path="/models/llama_3_1_8b_instruct")
     print(f"Number of parameters: {count_parameters(model):,}")
     print_model_summary(model)
