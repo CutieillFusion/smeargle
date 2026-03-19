@@ -28,3 +28,7 @@ models/*
 !models/pyproject.toml
 !models/download_hf_model.py
 !models/uv.lock
+
+.claude/*
+.vscode/*
+.cursor/*
