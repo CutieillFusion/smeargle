@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=EAGLE3
-#SBATCH --output=train_eagle3.out
-#SBATCH --error=train_eagle3.err
+#SBATCH --output=test_eagle3.out
+#SBATCH --error=test_eagle3.err
 #SBATCH --partition=dgxh100
 #SBATCH --time=72:00:00
 #SBATCH --gres=gpu:4

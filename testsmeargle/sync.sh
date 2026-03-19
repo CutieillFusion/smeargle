@@ -1,8 +1,8 @@
-cd /data/ai_club/smeargle/refactor
+cd /data/ai_club/smeargle/testsmeargle
 
 # Mount your project and use host's uv
 singularity exec --nv \
-  --bind /data/ai_club/smeargle/refactor:/workspace \
+  --bind /data/ai_club/smeargle/testsmeargle:/workspace \
   --bind /data/ai_club/smeargle/datasets:/datasets \
   --bind /data/ai_club/smeargle/models:/models \
   --bind ~/.local/bin:/usr/local/bin \

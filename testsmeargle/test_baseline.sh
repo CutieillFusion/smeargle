@@ -9,11 +9,11 @@
 #SBATCH --mem=300G
 #SBATCH --account=undergrad_research
 
-cd /data/ai_club/smeargle/testrefactor
+cd /data/ai_club/smeargle/testsmeargle
 
 # Mount project
 singularity exec --nv \
-  --bind /data/ai_club/smeargle/testrefactor:/workspace \
+  --bind /data/ai_club/smeargle/testsmeargle:/workspace \
   --bind /data/ai_club/smeargle/datasets:/datasets \
   --bind /data/ai_club/smeargle/models:/models \
   ../containers/cuda_12.0.0-devel-ubuntu22.04.sif \
@@ -27,6 +27,4 @@ singularity exec --nv \
       --answer-file-path /workspace \
       --benchmark-path /datasets/spec_bench \
       --temperature 0.0 \
-      --warmup-steps 3 \
-      --question-begin 0 \
-      --question-end 1"
+      --warmup-steps 3"

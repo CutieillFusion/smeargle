@@ -9,11 +9,11 @@
 #SBATCH --mem=300G
 #SBATCH --account=undergrad_research
 
-cd /data/ai_club/smeargle/testrefactor_tree
+cd /data/ai_club/smeargle/testsmeargle
 
 # Mount project
 singularity exec --nv \
-  --bind /data/ai_club/smeargle/testrefactor_tree:/workspace \
+  --bind /data/ai_club/smeargle/testsmeargle:/workspace \
   --bind /data/ai_club/smeargle/datasets:/datasets \
   --bind /data/ai_club/smeargle/models:/models \
   ../containers/cuda_12.0.0-devel-ubuntu22.04.sif \

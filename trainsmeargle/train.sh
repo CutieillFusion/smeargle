@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=REFACTOR
-#SBATCH --output=models/%j/train_refactor.out
-#SBATCH --error=models/%j/train_refactor.err
+#SBATCH --job-name=SMEARGLE
+#SBATCH --output=models/%j/train_smeargle.out
+#SBATCH --error=models/%j/train_smeargle.err
 #SBATCH --partition=dgxh100
 #SBATCH --time=14-00:00:00
 #SBATCH --gres=gpu:4
@@ -9,18 +9,13 @@
 #SBATCH --mem=600G
 #SBATCH --account=undergrad_research
 
-cd /data/ai_club/smeargle/refactor
+cd /data/ai_club/smeargle/trainsmeargle
 
 SAVEDIR=${1:-$SLURM_JOB_ID}
 
-# if [ -d "models/$SAVEDIR" ]; then
-#   echo "Directory models/$SAVEDIR already exists"
-#   rm -rf "models/$SAVEDIR"
-# fi
-
 # Mount your project and use host's uv
 singularity exec --nv \
-  --bind /data/ai_club/smeargle/refactor:/workspace \
+  --bind /data/ai_club/smeargle/trainsmeargle:/workspace \
   --bind /data/ai_club/smeargle/datasets:/datasets \
   --bind /data/ai_club/smeargle/models:/models \
   --bind ~/.local/bin:/usr/local/bin \
