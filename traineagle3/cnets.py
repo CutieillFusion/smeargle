@@ -24,6 +24,7 @@ from typing import Callable, List, Optional, Tuple
 from collections import Counter
 import torch
 from torch import nn, Tensor
+import torch.nn.functional as F
 import os
 from transformers.activations import ACT2FN
 from transformers import AutoTokenizer
@@ -286,20 +287,18 @@ class LlamaAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config.attn_implementation is not None:
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config.attn_implementation]
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
+        attn_output = F.scaled_dot_product_attention(
+            query_states, key_states, value_states,
+            attn_mask=None,
+            dropout_p=0.0 if not self.training else self.attention_dropout,
+            is_causal=True,
+            scale=self.scaling,
         )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_weights = None
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -411,7 +410,8 @@ class Model(nn.Module):
         self.length = 7
 
         self._target_model = LlamaForCausalLM.from_pretrained(
-            path, dtype=torch.bfloat16, low_cpu_mem_usage=True
+            path, dtype=torch.bfloat16, low_cpu_mem_usage=True,
+            attn_implementation="sdpa"
         )
         self._target_model.config.use_cache = False
         self._target_model.eval()
@@ -693,19 +693,6 @@ class Model(nn.Module):
         if self.gradient_checkpointing and self.training and use_cache:
             use_cache = False
 
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length),
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-        attention_mask = self._prepare_decoder_attention_mask(
-            attention_mask,
-            (batch_size, seq_length),
-            hidden_states,
-            0,
-        )
-
         if position_ids is None:
             position_ids = torch.arange(
                 seq_length,
@@ -744,7 +731,7 @@ class Model(nn.Module):
             hidden_states = self.midlayer(
                 input_emb=inputs_embeds,
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                attention_mask=None,
                 position_ids=position_ids,
                 past_key_values=None,
                 use_cache=use_cache,

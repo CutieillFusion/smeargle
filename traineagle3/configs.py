@@ -103,7 +103,7 @@ class EagleConfig(PretrainedConfig):
         attention_dropout=0.0,
         attention_bias=False,
         mlp_bias=True,
-        attn_implementation="eager",
+        attn_implementation=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
