@@ -3,6 +3,7 @@ import deepspeed
 import json
 import re
 import os
+import time
 import torch
 from cnets import Model
 from configs import EagleConfig
@@ -287,6 +288,97 @@ if checkpoint_path:
     print(f"load from {checkpoint_path}")
     model_engine.load_checkpoint(checkpoint_path)
 
+class StepProfiler:
+    def __init__(self, print_every=50, rank=0, model=None):
+        self.print_every = print_every
+        self.rank = rank
+        self.model = model
+        self.step_count = 0
+        self.gpu_phases = {}  # name -> list of (start_event, end_event)
+        self.cpu_times = {}   # name -> list of elapsed_ms
+
+    def start_gpu(self, name):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        self.gpu_phases.setdefault(name, []).append((start, end))
+
+    def end_gpu(self, name):
+        _, end = self.gpu_phases[name][-1]
+        end.record()
+
+    def record_cpu(self, name, start_time):
+        elapsed_ms = (time.monotonic() - start_time) * 1000
+        self.cpu_times.setdefault(name, []).append(elapsed_ms)
+
+    def step(self):
+        self.step_count += 1
+        if self.step_count % self.print_every == 0 and self.rank == 0:
+            self._print_summary()
+
+    def _print_summary(self):
+        torch.cuda.synchronize()
+        parts = []
+        draft_sub_parts = []
+        mid_sub_parts = []
+        total = 0.0
+        phase_order = ["data_load", "data_to_gpu", "forward", "backward", "optimizer_step"]
+        for name in phase_order:
+            if name in self.cpu_times:
+                avg = sum(self.cpu_times[name]) / len(self.cpu_times[name])
+                parts.append(f"{name}={avg:.1f}")
+                total += avg
+            elif name in self.gpu_phases:
+                times = [s.elapsed_time(e) for s, e in self.gpu_phases[name]]
+                avg = sum(times) / len(times)
+                if name == "forward" and self.model is not None and self.model._profile_times:
+                    sub_parts = []
+                    for sub_name in ["dataprepare", "draft_forward"]:
+                        if sub_name in self.model._profile_times:
+                            sub_times = [s.elapsed_time(e) for s, e in self.model._profile_times[sub_name]]
+                            sub_avg = sum(sub_times) / len(sub_times)
+                            sub_parts.append(f"{sub_name}={sub_avg:.1f}")
+                    parts.append(f"{name}={avg:.1f} ({', '.join(sub_parts)})")
+                    # Collect draft sub-component timings for second line
+                    draft_sub_parts = []
+                    for sub_key, label in [
+                        ("draft_setup", "setup"),
+                        ("embed_tokens", "embed"),
+                        ("midlayer", "midlayer"),
+                        ("norm", "norm"),
+                        ("lm_head", "lm_head"),
+                        ("loss_comp", "loss"),
+                    ]:
+                        if sub_key in self.model._profile_times:
+                            sub_times = [s.elapsed_time(e) for s, e in self.model._profile_times[sub_key]]
+                            sub_avg = sum(sub_times) / len(sub_times)
+                            draft_sub_parts.append(f"{label}={sub_avg:.1f}")
+                    # Collect midlayer sub-component timings for third line
+                    mid_sub_parts = []
+                    for sub_key, label in [
+                        ("mid_fc", "fc"),
+                        ("mid_attn", "attn"),
+                        ("mid_ff", "ff"),
+                    ]:
+                        if sub_key in self.model._profile_times:
+                            sub_times = [s.elapsed_time(e) for s, e in self.model._profile_times[sub_key]]
+                            sub_avg = sum(sub_times) / len(sub_times)
+                            mid_sub_parts.append(f"{label}={sub_avg:.1f}")
+                    self.model._profile_times.clear()
+                else:
+                    parts.append(f"{name}={avg:.1f}")
+                total += avg
+        parts.append(f"total={total:.1f}")
+        start = self.step_count - self.print_every + 1
+        print(f"[Profile] Step {start}-{self.step_count} avg (ms): {' | '.join(parts)}")
+        if draft_sub_parts:
+            print(f"  draft: {' | '.join(draft_sub_parts)}")
+        if mid_sub_parts:
+            print(f"    midlayer: {' | '.join(mid_sub_parts)}")
+        self.gpu_phases.clear()
+        self.cpu_times.clear()
+
+
 def print_rank(message: str):
     if global_rank == 0:
         print(message)
@@ -313,27 +405,48 @@ for epoch in range(start_epoch, num_epochs):
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
 
+    model.profiling = True
+    profiler = StepProfiler(print_every=50, rank=global_rank, model=model)
+    data_iter_start = time.monotonic()
+
     for data in tqdm(train_loader):
+        profiler.record_cpu("data_load", data_iter_start)
         model.zero_grad()
 
+        profiler.start_gpu("data_to_gpu")
         device = next(model_engine.module.parameters()).device
+        input_ids = data["input_ids"].to(device)
+        attention_mask = data["attention_mask"].to(device)
+        loss_mask = data["loss_mask"].to(device)
+        profiler.end_gpu("data_to_gpu")
+
+        profiler.start_gpu("forward")
         plosses, acces = model_engine(
-            input_ids=data["input_ids"].to(device),
-            attention_mask=data["attention_mask"].to(device),
-            loss_mask=data["loss_mask"].to(device),
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
         )
+        profiler.end_gpu("forward")
 
         ploss_weight = [0.8**i for i in range(len(plosses))]
         ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
         loss = ploss
-        model_engine.backward(loss)
 
+        profiler.start_gpu("backward")
+        model_engine.backward(loss)
+        profiler.end_gpu("backward")
+
+        profiler.start_gpu("optimizer_step")
         model_engine.step()
+        profiler.end_gpu("optimizer_step")
 
         epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
         epoch_plosses = [
             epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
         ]
+
+        profiler.step()
+        data_iter_start = time.monotonic()
 
     reduce_and_print(epoch_acces, "Train", "Acc", epoch)
     reduce_and_print(epoch_plosses, "Train", "pLoss", epoch)

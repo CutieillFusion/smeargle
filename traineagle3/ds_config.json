@@ -2,8 +2,8 @@
     "fp16": { 
         "enabled": false 
     },
-    "bf16": { 
-        "enabled": false 
+    "bf16": {
+        "enabled": true
     },
     "optimizer": {
         "type": "AdamW",
