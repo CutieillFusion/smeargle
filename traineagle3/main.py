@@ -320,7 +320,6 @@ class StepProfiler:
         torch.cuda.synchronize()
         parts = []
         draft_sub_parts = []
-        mid_sub_parts = []
         total = 0.0
         phase_order = ["data_load", "data_to_gpu", "forward", "backward", "optimizer_step"]
         for name in phase_order:
@@ -353,17 +352,6 @@ class StepProfiler:
                             sub_times = [s.elapsed_time(e) for s, e in self.model._profile_times[sub_key]]
                             sub_avg = sum(sub_times) / len(sub_times)
                             draft_sub_parts.append(f"{label}={sub_avg:.1f}")
-                    # Collect midlayer sub-component timings for third line
-                    mid_sub_parts = []
-                    for sub_key, label in [
-                        ("mid_fc", "fc"),
-                        ("mid_attn", "attn"),
-                        ("mid_ff", "ff"),
-                    ]:
-                        if sub_key in self.model._profile_times:
-                            sub_times = [s.elapsed_time(e) for s, e in self.model._profile_times[sub_key]]
-                            sub_avg = sum(sub_times) / len(sub_times)
-                            mid_sub_parts.append(f"{label}={sub_avg:.1f}")
                     self.model._profile_times.clear()
                 else:
                     parts.append(f"{name}={avg:.1f}")
@@ -373,8 +361,6 @@ class StepProfiler:
         print(f"[Profile] Step {start}-{self.step_count} avg (ms): {' | '.join(parts)}")
         if draft_sub_parts:
             print(f"  draft: {' | '.join(draft_sub_parts)}")
-        if mid_sub_parts:
-            print(f"    midlayer: {' | '.join(mid_sub_parts)}")
         self.gpu_phases.clear()
         self.cpu_times.clear()
 

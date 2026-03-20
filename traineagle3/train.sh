@@ -30,8 +30,8 @@ singularity exec --nv \
     .venv/bin/python .venv/bin/deepspeed --master_port 29000 main.py \
       --deepspeed_config ds_config.json \
       --basepath /models/llama_3_1_8b_instruct \
-      --trainpath /datasets/train.jsonl \
-      --testpath /datasets/test.jsonl \
+      --trainpath /datasets/train_5k.jsonl \
+      --testpath /datasets/test_5k.jsonl \
       --epochs 40 \
       --savedir $SAVEDIR
   "

@@ -331,25 +331,11 @@ class EagleDecoderLayeremb(GradientCheckpointingLayer):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
-        _prof = getattr(self, "_profiling", False)
-        _ptimes = getattr(self, "_profile_times", None) if _prof else None
-
         residual = hidden_states
-
-        if _prof:
-            _fc_t0 = torch.cuda.Event(enable_timing=True)
-            _fc_t0.record()
 
         hidden_states = self.hidden_norm(hidden_states)
         input_emb = self.input_layernorm(input_emb)
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
-
-        if _prof:
-            _fc_t1 = torch.cuda.Event(enable_timing=True)
-            _fc_t1.record()
-            _ptimes.setdefault("mid_fc", []).append((_fc_t0, _fc_t1))
-            _attn_t0 = torch.cuda.Event(enable_timing=True)
-            _attn_t0.record()
 
         # Self Attention
         hidden_states, _ = self.self_attn(
@@ -364,24 +350,11 @@ class EagleDecoderLayeremb(GradientCheckpointingLayer):
         )
         hidden_states = residual + hidden_states
 
-        if _prof:
-            _attn_t1 = torch.cuda.Event(enable_timing=True)
-            _attn_t1.record()
-            _ptimes.setdefault("mid_attn", []).append((_attn_t0, _attn_t1))
-            _ff_t0 = torch.cuda.Event(enable_timing=True)
-            _ff_t0.record()
-
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-
-        if _prof:
-            _ff_t1 = torch.cuda.Event(enable_timing=True)
-            _ff_t1.record()
-            _ptimes.setdefault("mid_ff", []).append((_ff_t0, _ff_t1))
-
         return hidden_states
 
 
@@ -447,7 +420,6 @@ class Model(nn.Module):
         self._target_model = torch.compile(self._target_model, mode="max-autotune-no-cudagraphs")
 
         self.fc = nn.Linear(self.hidden_size * 3, self.hidden_size, bias=False)
-        self.smooth_l1 = nn.SmoothL1Loss(reduction="none")
         
         try:
             with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
@@ -476,6 +448,10 @@ class Model(nn.Module):
         self.lm_head = nn.Linear(
             self.hidden_size, self.draft_vocab_size, bias=False
         )
+
+        self.midlayer = torch.compile(self.midlayer, mode="max-autotune-no-cudagraphs")
+        self.fc = torch.compile(self.fc)
+        self.lm_head = torch.compile(self.lm_head)
 
         self.profiling = False
         self._profile_times = {}  # name -> list of elapsed_ms
@@ -747,8 +723,6 @@ class Model(nn.Module):
         self.t2d = self.t2d.to(hidden_states.device)
 
         self.midlayer.gradient_checkpointing = False
-        self.midlayer._profiling = self.profiling
-        self.midlayer._profile_times = self._profile_times
 
         plosses = []
         acces = []
@@ -814,13 +788,6 @@ class Model(nn.Module):
             plogp = target_p * out_logp
             sum_logit = torch.sum(position_mask * plogp, 2)
             loss = -sum_logit.mean()
-
-            student_p = torch.exp(out_logp)
-            smooth_l1_per_elem = self.smooth_l1(student_p, target_p)
-            smooth_l1_per_pos = smooth_l1_per_elem.mean(dim=2)
-            smooth_l1_masked = (position_mask.squeeze(-1) * smooth_l1_per_pos).sum() / (position_mask.sum() + 1e-6)
-
-            loss = loss + 0.1 * smooth_l1_masked
 
             if self.profiling:
                 _loss_t1 = torch.cuda.Event(enable_timing=True)
