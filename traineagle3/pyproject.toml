@@ -1,5 +1,5 @@
 [project]
-name = "refactor"
+name = "traineagle3"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -18,9 +18,7 @@ dependencies = [
     "huggingface-hub>=0.24.0,",
     "black>=24.4.2",
     "einops>=0.8.1",
-    "flash-linear-attention>=0.4.0",
     "triton>=3.0.0",
     "datasets>=4.4.1",
-    "mamba-ssm[causal-conv1d]>=2.2.6.post3",
 ]
 
