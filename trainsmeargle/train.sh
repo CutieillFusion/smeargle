@@ -4,7 +4,7 @@
 #SBATCH --error=models/%j/train_smeargle.err
 #SBATCH --partition=dgxh100
 #SBATCH --time=14-00:00:00
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:7
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=600G
 #SBATCH --account=undergrad_research
@@ -30,8 +30,8 @@ singularity exec --nv \
     .venv/bin/python .venv/bin/deepspeed --master_port 29000 main.py \
       --deepspeed_config ds_config.json \
       --basepath /models/llama_3_1_8b_instruct \
-      --trainpath /datasets/train.jsonl \
-      --testpath /datasets/test.jsonl \
-      --epochs 40 \
+      --trainpath /datasets/perfect_blend/train_regen.jsonl \
+      --testpath /datasets/perfect_blend/test_regen.jsonl \
+      --epochs 10 \
       --savedir $SAVEDIR
   "

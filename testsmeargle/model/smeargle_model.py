@@ -66,7 +66,13 @@ class SmeargleModel(nn.Module):
         if config.vocab_size == config.draft_vocab_size:
             del self.smeargle_layer.d2t, self.smeargle_layer.t2d
 
+        # Strip _orig_mod. prefix added by torch.compile() in training checkpoints
+        smeargle_layer_state_dict = {k.replace('_orig_mod.', ''): v for k, v in smeargle_layer_state_dict.items()}
         load_ = self.smeargle_layer.load_state_dict(smeargle_layer_state_dict, strict=False)
+        unexpected_missing = [k for k in load_.missing_keys if 'embed_tokens' not in k]
+        if unexpected_missing:
+            import warnings
+            warnings.warn(f"Smeargle layer has unexpected missing keys: {unexpected_missing}")
         self.smeargle_layer.to(self.base_model.dtype).to(device)
         self.smeargle_layer.init_tree()
 
@@ -239,12 +245,16 @@ class SmeargleModel(nn.Module):
         new_token = 0
         max_length = max_length - self.smeargle_layer.total_tokens - 10
         accept_lengths = []
+        target_time = 0.0
+        draft_time = 0.0
         for idx in range(max_length):
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens = draft_tokens.to(input_ids.device)
 
             # Target model forward, get logits
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
@@ -253,6 +263,8 @@ class SmeargleModel(nn.Module):
                 input_ids,
                 retrieve_indices,
             )
+            torch.cuda.synchronize()
+            target_time += time.perf_counter() - t0
 
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
             candidates = draft_tokens[0, retrieve_indices]
@@ -264,6 +276,8 @@ class SmeargleModel(nn.Module):
             accept_lengths.append(accept_length)
 
             # Adjusting the input sequence, draft model forward
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
             (
                 input_ids,
                 draft_tokens,
@@ -287,6 +301,8 @@ class SmeargleModel(nn.Module):
                 hidden_state_new,
                 sample_p,
             )
+            torch.cuda.synchronize()
+            draft_time += time.perf_counter() - t0
 
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
@@ -302,7 +318,7 @@ class SmeargleModel(nn.Module):
         if not log:
             return input_ids
         else:
-            return input_ids, accept_lengths
+            return input_ids, accept_lengths, target_time, draft_time
 
     @torch.no_grad()
     def naivegenerate(

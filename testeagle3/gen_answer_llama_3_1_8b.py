@@ -127,7 +127,7 @@ def get_model_answers(
                 [prompt],
                 add_special_tokens=False,
             ).input_ids
-            output_ids, new_token, idx, accept_length = generate(
+            output_ids, new_token, idx, accept_length, *_ = generate(
                 torch.as_tensor(input_ids).cuda(),
                 temperature=temperature,
                 log=True,
@@ -182,6 +182,8 @@ def get_model_answers(
             idxs = []
             new_tokens = []
             wall_time = []
+            target_times = []
+            draft_times = []
             for j in range(len(question["turns"])):
                 question_turn = question["turns"][j]
                 messages.append({"role": "user", "content": question_turn})
@@ -205,7 +207,7 @@ def get_model_answers(
                 torch.cuda.synchronize()
                 start_time = time.time()
 
-                output_ids, new_token, idx, accept_lengths = generate(
+                result = generate(
                     torch.as_tensor(input_ids).cuda(),
                     temperature=temperature,
                     log=True,
@@ -215,6 +217,12 @@ def get_model_answers(
                 # End Timing Inference
                 torch.cuda.synchronize()
                 total_time = time.time() - start_time
+
+                if use_eagle3:
+                    output_ids, new_token, idx, accept_lengths, target_model_time, draft_model_time = result
+                else:
+                    output_ids, new_token, idx, accept_lengths = result
+                    target_model_time, draft_model_time = total_time, 0.0
 
                 output_ids = output_ids[0][len(input_ids[0]) :]
 
@@ -250,6 +258,8 @@ def get_model_answers(
                 idxs.append(int(idx))
                 new_tokens.append(int(new_token))
                 wall_time.append(total_time)
+                target_times.append(target_model_time)
+                draft_times.append(draft_model_time)
                 messages.append({"role": "assistant", "content": output})
 
             if use_eagle3:
@@ -257,33 +267,39 @@ def get_model_answers(
                 accept_lengths_int = [int(al) if hasattr(al, 'item') else int(al) for al in accept_lengths]
                 
                 # DIAGNOSTIC LOGGING: Track acceptance per position more accurately
-                # max_accept_len = max(accept_lengths_int) if accept_lengths_int else 0
-                # accept_length_per_position = [0.0 for _ in range(max_accept_len)]
+                max_accept_len = max(accept_lengths_int) if accept_lengths_int else 0
+                accept_length_per_position = [0.0 for _ in range(max_accept_len)]
                 
-                # # Count how many times each position was proposed (denominator)
-                # proposals_per_position = [0.0 for _ in range(max_accept_len)]
+                # Count how many times each position was proposed (denominator)
+                proposals_per_position = [0.0 for _ in range(max_accept_len)]
                 
-                # for al in accept_lengths_int:
-                #     # Each iteration proposes up to depth positions
-                #     for pos_idx in range(min(depth + 1, max_accept_len)):
-                #         proposals_per_position[pos_idx] += 1.0
-                #     # Only positions up to accept_length were accepted
-                #     for pos_idx in range(al):
-                #         accept_length_per_position[pos_idx] += 1.0
+                for al in accept_lengths_int:
+                    # Each iteration proposes up to depth positions
+                    for pos_idx in range(min(depth + 1, max_accept_len)):
+                        proposals_per_position[pos_idx] += 1.0
+                    # Only positions up to accept_length were accepted
+                    for pos_idx in range(al):
+                        accept_length_per_position[pos_idx] += 1.0
                 
-                # # Diagnostic: Print detailed stats for first choice of each question
-                # if i == 0:
-                #     print(f"\n=== DIAGNOSTIC: Acceptance Stats for Question {question['question_id']} ===")
-                #     print(f"Total decoding iterations: {len(accept_lengths_int)}")
-                #     print(f"Accept lengths distribution: {dict(zip(*np.unique(accept_lengths_int, return_counts=True)))}")
-                #     print(f"Mean accept length: {np.mean(accept_lengths_int):.2f}")
-                #     print(f"\nPer-position stats (true rate = accepted/proposed at each position):")
-                #     for pos in range(min(8, max_accept_len)):  # Show first 8 positions
-                #         proposed = proposals_per_position[pos] if pos < len(proposals_per_position) else 0
-                #         accepted = accept_length_per_position[pos] if pos < len(accept_length_per_position) else 0
-                #         rate = accepted / proposed if proposed > 0 else 0
-                #         print(f"  Position {pos+1}: accepted={int(accepted)}, proposed={int(proposed)}, true_rate={rate:.3f}")
-                #     print("=" * 60 + "\n")
+                # Diagnostic: Print detailed stats for first choice of each question
+                if i == 0:
+                    print(f"\n=== DIAGNOSTIC: Acceptance Stats for Question {question['question_id']} ===")
+                    print(f"Total decoding iterations: {len(accept_lengths_int)}")
+                    print(f"Accept lengths distribution: {dict(zip(*np.unique(accept_lengths_int, return_counts=True)))}")
+                    print(f"Mean accept length: {np.mean(accept_lengths_int):.2f}")
+                    print(f"\nPer-position stats (true rate = accepted/proposed at each position):")
+                    for pos in range(min(8, max_accept_len)):  # Show first 8 positions
+                        proposed = proposals_per_position[pos] if pos < len(proposals_per_position) else 0
+                        accepted = accept_length_per_position[pos] if pos < len(accept_length_per_position) else 0
+                        rate = accepted / proposed if proposed > 0 else 0
+                        print(f"  Position {pos+1}: accepted={int(accepted)}, proposed={int(proposed)}, true_rate={rate:.3f}")
+                    
+                    total_draft_time = sum(draft_times)
+                    total_target_time = sum(target_times)
+                    total_time = total_draft_time + total_target_time
+                    print("eagle3 draft ratio:", total_draft_time / total_time)
+                    print("eagle3 target ratio:", total_target_time / total_time)
+                    print("=" * 60 + "\n")
                 
                 for al in accept_lengths_int:
                     global_acceptance_lengths[al] += 1.0
@@ -297,6 +313,8 @@ def get_model_answers(
                     "idxs": idxs,
                     "new_tokens": new_tokens,
                     "wall_time": wall_time,
+                    "target_model_time": target_times,
+                    "draft_model_time": draft_times,
                     "acceptance_lengths": dict(zip(*[a.tolist() for a in np.unique(accept_lengths_int, return_counts=True)])),
                 })
             else:
@@ -307,6 +325,8 @@ def get_model_answers(
                         "idxs": idxs,
                         "new_tokens": new_tokens,
                         "wall_time": wall_time,
+                        "target_model_time": target_times,
+                        "draft_model_time": draft_times,
                     }
                 )
 
@@ -321,28 +341,6 @@ def get_model_answers(
                 "tstamp": time.time(),
             }
             fout.write(json.dumps(ans_json) + "\n")
-
-    if use_eagle3:
-        # Reverse cumulative sum: position k shows count of acceptance lengths >= k
-        cumulative = np.cumsum(np.array(global_acceptance_lengths)[::-1])[::-1]
-        cumulative = cumulative / cumulative[0]
-        plt.figure(figsize=(8, 5))
-        plt.plot(
-            range(len(cumulative)),
-            cumulative,
-            marker="o",
-        )
-        plt.xlabel("Position")
-        plt.ylabel("Acceptance Rate")
-        plt.title("Acceptance Rate Per Position")
-        plt.ylim(0, 1.05)
-        plt.grid(True)
-        # Save to answer file directory
-        chart_dir = os.path.dirname(answer_file)
-        plt.savefig(
-            os.path.join(chart_dir, "acceptance_rate_per_position.png")
-        )
-        plt.close()
 
 
 def reorg_answer_file(answer_file):
@@ -456,7 +454,7 @@ if __name__ == "__main__":
 
     question_file = f"{args.benchmark_path}/question.jsonl"
 
-    model_id = f"{args.base_model_path.split('/')[-1]}_{'eagle3' if args.use_eagle3 else 'baseline'}_temperature_{args.temperature}"
+    model_id = f"{args.base_model_path.split('/')[-1]}_{'eagle3' if args.use_eagle3 else 'baseline'}_temperature_{str(args.temperature).replace('.', '_')}_{args.benchmark_path.split('/')[-1]}"
 
     answer_file = f"{args.answer_file_path}/{model_id}.jsonl"
 

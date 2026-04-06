@@ -162,7 +162,7 @@ def build_dataset_rank(tokenizer, datapath):
         remove_columns=ds.column_names,
         load_from_cache_file=False,
     )
-    
+
     ds.set_format(type="torch")
     return ds
 
@@ -287,6 +287,8 @@ if checkpoint_path:
     print(f"load from {checkpoint_path}")
     model_engine.load_checkpoint(checkpoint_path)
 
+
+
 def print_rank(message: str):
     if global_rank == 0:
         print(message)
@@ -317,15 +319,19 @@ for epoch in range(start_epoch, num_epochs):
         model.zero_grad()
 
         device = next(model_engine.module.parameters()).device
+        input_ids = data["input_ids"].to(device)
+        attention_mask = data["attention_mask"].to(device)
+        loss_mask = data["loss_mask"].to(device)
+
         plosses, acces = model_engine(
-            input_ids=data["input_ids"].to(device),
-            attention_mask=data["attention_mask"].to(device),
-            loss_mask=data["loss_mask"].to(device),
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
         )
 
-        ploss_weight = [0.8**i for i in range(len(plosses))]
-        ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
-        loss = ploss
+        ploss_stack = torch.stack(plosses)
+        loss = (model.ploss_weights.to(ploss_stack.device) * ploss_stack).sum()
+
         model_engine.backward(loss)
 
         model_engine.step()
@@ -376,7 +382,7 @@ for epoch in range(start_epoch, num_epochs):
 
     # clear out the redundance cache after each step
     torch.cuda.empty_cache()
-    
+
     model_engine.save_checkpoint(f"{savedir}/state_{epoch}")
     model_engine.save_16bit_model(
         f"{savedir}/state_{epoch}", exclude_frozen_parameters=True

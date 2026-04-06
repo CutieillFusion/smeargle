@@ -4,7 +4,7 @@
 #SBATCH --error=models/%j/train_eagle3.err
 #SBATCH --partition=dgxh100
 #SBATCH --time=14-00:00:00
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:6
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=600G
 #SBATCH --account=undergrad_research
@@ -27,11 +27,11 @@ singularity exec --nv \
     export PATH=\$CUDA_HOME/bin:\$PATH && \
     export LD_LIBRARY_PATH=\$CUDA_HOME/lib64:\$LD_LIBRARY_PATH && \
     uv sync && \
-    .venv/bin/python .venv/bin/deepspeed --master_port 29000 main.py \
+    .venv/bin/python .venv/bin/deepspeed --master_port 29002 main.py \
       --deepspeed_config ds_config.json \
       --basepath /models/llama_3_1_8b_instruct \
-      --trainpath /datasets/train.jsonl \
-      --testpath /datasets/test.jsonl \
-      --epochs 40 \
+      --trainpath /datasets/perfect_blend/train_regen.jsonl \
+      --testpath /datasets/perfect_blend/test_regen.jsonl \
+      --epochs 10 \
       --savedir $SAVEDIR
   "

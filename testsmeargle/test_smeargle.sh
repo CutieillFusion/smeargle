@@ -22,11 +22,11 @@ singularity exec --nv \
     export CUDA_HOME=/usr/local/cuda && \
     export PATH=\$CUDA_HOME/bin:\$PATH && \
     .venv/bin/python gen_answer_llama_3_1_8b.py \
-      --smeargle-model-path /models/smeargle_3_1_8b_instruct_10_epoch \
+      --smeargle-model-path /models/smeargle_3_1_8b_instruct_perfect_blend \
       --base-model-path /models/llama_3_1_8b_instruct \
       --answer-file-path /workspace \
       --benchmark-path /datasets/wiki_long \
       --temperature 0.0 \
-      --depth 5 \
+      --depth 7 \
       --warmup-steps 3 \
       --use-smeargle"

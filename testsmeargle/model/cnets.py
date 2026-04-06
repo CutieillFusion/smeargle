@@ -383,9 +383,10 @@ class Model(nn.Module):
         self.stable_cache_len = input_ids.shape[1]
 
         # === Initial top_k from last hidden state ===
-        last_hidden = out_hidden[:, -1]
+        # Apply norm to match training, where normed hidden states flow into next depth
+        last_hidden = self.norm(out_hidden[:, -1])
 
-        last_headout = self.lm_head(self.norm(last_hidden))
+        last_headout = self.lm_head(last_hidden)
 
         last_p = self.logsoftmax(last_headout)
         top = torch.topk(last_p, top_k, dim=-1)
@@ -433,7 +434,9 @@ class Model(nn.Module):
             parents_list.append(parents)
 
             # Get top_k logits per candidate: out_hidden is [top_k, 1, hidden_size]
-            last_headout = self.lm_head(self.norm(out_hidden[:, -1]))  # [top_k, draft_vocab]
+            # Apply norm to match training (normed output feeds into both lm_head and next depth)
+            normed_out = self.norm(out_hidden[:, -1])  # [top_k, hidden_size]
+            last_headout = self.lm_head(normed_out)  # [top_k, draft_vocab]
             last_p = self.logsoftmax(last_headout)
 
             top = torch.topk(last_p, top_k, dim=-1)
@@ -451,7 +454,7 @@ class Model(nn.Module):
             # Reindex MAMBA states for winning parents
             cache_params = reindex_mamba_cache(cache_params, out_ids)
 
-            input_hidden = out_hidden[out_ids, -1:]  # [top_k, 1, hidden_size]
+            input_hidden = normed_out[out_ids].unsqueeze(1)  # [top_k, 1, hidden_size]
 
             input_ids = topk_index.view(-1)[topk_cs_index][:, None]  # [top_k, 1]
 

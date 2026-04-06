@@ -32,3 +32,10 @@ models/*
 .claude/*
 .vscode/*
 .cursor/*
+
+!mics2026/*/*.jsonl
+!mics2026/*.jsonl
+!rosie2026/*/*.jsonl
+!rosie2026/*.jsonl
+!comp2026/*/*.jsonl
+!comp2026/*.jsonl

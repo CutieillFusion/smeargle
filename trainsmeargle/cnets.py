@@ -24,6 +24,7 @@ from typing import List, Optional, Tuple
 from collections import Counter
 import torch
 from torch import nn
+import torch.nn.functional as F
 import os
 from transformers.activations import ACT2FN
 from transformers import AutoTokenizer
@@ -52,7 +53,7 @@ class Mamba2(nn.Module):
         hidden_states: torch.Tensor,
         cache_params: Optional[Mamba2Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[Mamba2Cache], Optional[torch.LongTensor]]:
+    ) -> torch.Tensor:
 
         output = self.mamba2(
             hidden_states=hidden_states,
@@ -64,7 +65,7 @@ class Mamba2(nn.Module):
         output = output.to(self.out_proj.weight.dtype)
         output_proj = self.out_proj(output)
 
-        return output_proj, cache_params, cache_position
+        return output_proj
 
 
 class LlamaMLP(nn.Module):
@@ -121,17 +122,7 @@ class SmeargleDecoderLayeremb(nn.Module):
         self,
         input_emb: torch.Tensor,
         hidden_states: torch.Tensor,
-        cache_params: Optional[Mamba2Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.FloatTensor, Optional[Mamba2Cache], Optional[torch.LongTensor]]:
-        """
-        Args:
-            input_emb: Input embeddings (batch, seq_len, hidden_size)
-            hidden_states: Hidden states from target model (batch, seq_len, hidden_size)
-            cache_params: Mamba2Cache for incremental processing
-            cache_position: Tensor indicating position in sequence for cache
-        """
-
+    ) -> torch.Tensor:
         residual = hidden_states
 
         hidden_states = self.hidden_norm(hidden_states)
@@ -142,10 +133,8 @@ class SmeargleDecoderLayeremb(nn.Module):
         )
 
         # MAMBA block
-        hidden_states, cache_params, cache_position = self.mamba2(
+        hidden_states = self.mamba2(
             hidden_states=hidden_states,
-            cache_params=cache_params,
-            cache_position=cache_position,
         )
         hidden_states = residual + hidden_states
 
@@ -155,9 +144,7 @@ class SmeargleDecoderLayeremb(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states)
-
-        return outputs, cache_params, cache_position
+        return hidden_states
 
 
 @torch.no_grad()
@@ -192,6 +179,13 @@ def merge_dicts(dicts):
     return result
 
 
+@torch.compile(mode="max-autotune-no-cudagraphs")
+def _compute_loss(logits, target_p, position_mask):
+    out_logp = F.log_softmax(logits, dim=2)
+    plogp = target_p * out_logp
+    return -torch.sum(position_mask * plogp, 2).mean()
+
+
 class Model(nn.Module):
     def __init__(
         self,
@@ -210,13 +204,16 @@ class Model(nn.Module):
         self.draft_vocab_size = config.draft_vocab_size
         self.norm = LlamaRMSNorm(config.residual_size, eps=config.rms_norm_eps)
         self.length = 7
+        self.register_buffer("ploss_weights", torch.tensor([0.8**i for i in range(self.length)]), persistent=False)
 
         self._target_model = LlamaForCausalLM.from_pretrained(
-            path, dtype=torch.float16, low_cpu_mem_usage=True
+            path, dtype=torch.bfloat16, low_cpu_mem_usage=True
         )
+        self._target_model.config.use_cache = False
         self._target_model.eval()
         for param in self._target_model.parameters():
             param.requires_grad = False
+        self._target_model = torch.compile(self._target_model, mode="max-autotune-no-cudagraphs")
 
         self.fc = nn.Linear(self.hidden_size * 3, self.hidden_size, bias=False)
 
@@ -249,6 +246,12 @@ class Model(nn.Module):
             self.hidden_size, self.draft_vocab_size, bias=False
         )
 
+        compile_mode = "max-autotune-no-cudagraphs"
+        self.midlayer = torch.compile(self.midlayer, mode=compile_mode)
+        self.fc = torch.compile(self.fc, mode=compile_mode)
+        self.lm_head = torch.compile(self.lm_head, mode=compile_mode)
+        self.norm = torch.compile(self.norm, mode=compile_mode)
+
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
 
@@ -257,7 +260,7 @@ class Model(nn.Module):
             cache = torch.load("cache.pt")
             d2t = cache["d2t"]
             t2d = cache["t2d"]
-        elif local_rank != 0:         
+        elif local_rank != 0:
             while not os.path.exists("cache.pt"):
                 time.sleep(1)
             cache = torch.load("cache.pt")
@@ -385,7 +388,7 @@ class Model(nn.Module):
 
             d2t = torch.tensor(d2t)
             t2d = torch.tensor(t2d)
-            
+
             cache = {"d2t": d2t, "t2d": t2d}
             torch.save(cache, "cache.pt")
 
@@ -406,19 +409,15 @@ class Model(nn.Module):
         if model_device != device:
             target_model = target_model.to(device)
             self._target_model = target_model
+
         outs = target_model(input_ids=input_ids, attention_mask=attention_mask)
+
         assert len(outs.hidden_states) == 3, "target model hidden states length is not 3"
         hidden_states = torch.cat(outs.hidden_states, dim=-1)
         target = outs.logits
         target = padding(target, left=False)
         input_ids = padding(input_ids, left=False)
-
-        if target is not None:
-            target = target.to(device)
-            loss_mask = loss_mask[..., None]
-            loss_mask = loss_mask.to(device)
-
-        hidden_states = hidden_states.to(torch.float32)
+        loss_mask = loss_mask[..., None]
 
         return hidden_states, target, loss_mask, input_ids
 
@@ -442,71 +441,64 @@ class Model(nn.Module):
         ):
             hidden_states.requires_grad = True
 
+        hidden_states = hidden_states.to(self.fc.weight.dtype)
         hidden_states = self.fc(hidden_states)
 
         if self.gradient_checkpointing and self.training and use_cache:
             use_cache = False
 
-        cache_params: Optional[Mamba2Cache] = None
-        cache_position: Optional[torch.LongTensor] = None
-        if use_cache:
-            cache_params = Mamba2Cache(self.config, batch_size, device=hidden_states.device, dtype=hidden_states.dtype)
-            cache_position = torch.arange(0, seq_length, device=hidden_states.device, dtype=torch.long)
-
         self.t2d = self.t2d.to(hidden_states.device)
+
+        padded_input_ids = F.pad(input_ids, (0, self.length - 1), value=0)
+        padded_target = F.pad(target, (0, 0, 0, self.length - 1), value=0.0)
+        padded_loss_mask = F.pad(loss_mask, (0, 0, 0, self.length - 1), value=0.0)
+
+        with torch.no_grad():
+            all_position_mask = []
+            all_target_p = []
+            all_target_p_argmax = []
+            for idx in range(self.length):
+                cur_target = padded_target[:, idx:idx + seq_length]
+                cur_loss_mask = padded_loss_mask[:, idx:idx + seq_length]
+                target_max_token = cur_target.argmax(-1)
+                target_mask = self.t2d[target_max_token][..., None].int()
+                position_mask = target_mask * cur_loss_mask
+                target_head = cur_target[..., self.t2d]
+                target_p = F.softmax(target_head.float(), dim=2)
+                all_position_mask.append(position_mask)
+                all_target_p.append(target_p)
+                all_target_p_argmax.append(target_head.argmax(-1))
 
         plosses = []
         acces = []
         for idx in range(self.length):
 
-            inputs_embeds = self.embed_tokens(input_ids)
-
+            cur_input_ids = padded_input_ids[:, idx:idx + seq_length]
+            inputs_embeds = self.embed_tokens(cur_input_ids)
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
-            hidden_states, cache_params, cache_position = self.midlayer(
+            hidden_states = self.midlayer(
                 input_emb=inputs_embeds,
                 hidden_states=hidden_states,
-                cache_params=cache_params,
-                cache_position=cache_position,
             )
 
             hidden_states = self.norm(hidden_states)
+
             logits = self.lm_head(hidden_states)
             logits = logits.float()
 
-            with torch.no_grad():
-                target_head = target
-                target_max_token = target_head.argmax(-1)
-                # Move d2t to the same device as target_max_token
-                self.t2d = self.t2d.to(target_max_token.device)
-                target_mask = self.t2d[target_max_token]
-                target_mask = target_mask[..., None].int()
-                position_mask = target_mask * loss_mask
-                target_head = target_head[..., self.t2d]
-                target_head = target_head.float()
-                target_p = nn.Softmax(dim=2)(target_head)
+            target_p = all_target_p[idx]
+            position_mask = all_position_mask[idx]
 
-            out_logp = nn.LogSoftmax(dim=2)(logits)
-            plogp = target_p * out_logp
-            sum_logit = torch.sum(position_mask * plogp, 2)
-            loss = -sum_logit.mean()
+            loss = _compute_loss(logits, target_p, position_mask)
 
             plosses.append(loss)
 
-            if len(acces) == 0 or acces[-1] > 0:
-                acces.append(
-                    ((logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1))
-                    .sum()
-                    .item()
-                    / (loss_mask.sum().item() + 1e-6)
-                )
-            else:
-                acces.append(0)
+            acc_num = ((logits.argmax(-1) == all_target_p_argmax[idx]) * position_mask.squeeze(-1)).sum()
+            acc_den = padded_loss_mask[:, idx:idx + seq_length].sum() + 1e-6
+            acces.append(acc_num / acc_den)
 
-            if idx < self.length - 1:
-                input_ids = padding(input_ids, left=False)
-                target = padding(target, left=False)
-                loss_mask = padding(loss_mask, left=False)
+        acces = [a.item() for a in acces]
 
         return plosses, acces
 

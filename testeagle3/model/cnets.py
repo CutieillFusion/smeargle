@@ -848,9 +848,10 @@ class Model(nn.Module):
         # print("past_key_values shape", past_key_values[0][0].shape)
         
         self.stable_kv = past_key_values
-        last_hidden = out_hidden[:, -1]
+        # Apply norm to match training, where normed hidden states flow into next depth
+        last_hidden = self.norm(out_hidden[:, -1])
 
-        last_headout = self.lm_head(self.norm(last_hidden))
+        last_headout = self.lm_head(last_hidden)
 
         last_p = self.logsoftmax(last_headout)
         top = torch.topk(last_p, top_k, dim=-1)
@@ -894,7 +895,9 @@ class Model(nn.Module):
             parents = topk_cs_index + bias
             parents_list.append(parents)
 
-            last_headout = self.lm_head(self.norm(out_hidden[0]))
+            # Apply norm to match training (normed output feeds into both lm_head and next depth)
+            normed_out = self.norm(out_hidden[0])
+            last_headout = self.lm_head(normed_out)
             last_p = self.logsoftmax(last_headout)
 
             top = torch.topk(last_p, top_k, dim=-1)
@@ -907,7 +910,7 @@ class Model(nn.Module):
             scores = topk_cs_p
 
             out_ids = topk_cs_index // top_k
-            input_hidden = out_hidden[:, out_ids]
+            input_hidden = normed_out[out_ids].unsqueeze(0)
 
             input_ids = topk_index.view(-1)[topk_cs_index][None]
 

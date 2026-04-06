@@ -74,7 +74,13 @@ class EagleModel(nn.Module):
         if config.vocab_size == config.draft_vocab_size:
             del self.eagle_layer.d2t, self.eagle_layer.t2d
 
+        # Strip _orig_mod. prefix added by torch.compile() in training checkpoints
+        eagle_layer_state_dict = {k.replace('_orig_mod.', ''): v for k, v in eagle_layer_state_dict.items()}
         load_ = self.eagle_layer.load_state_dict(eagle_layer_state_dict, strict=False)
+        unexpected_missing = [k for k in load_.missing_keys if 'embed_tokens' not in k]
+        if unexpected_missing:
+            import warnings
+            warnings.warn(f"Eagle layer has unexpected missing keys: {unexpected_missing}")
         self.eagle_layer.to(self.base_model.dtype).to(device)
         self.eagle_layer.init_tree()
 
@@ -253,12 +259,16 @@ class EagleModel(nn.Module):
         new_token = 0
         max_length = max_length - self.eagle_layer.total_tokens - 10
         accept_lengths = []
+        target_time = 0.0
+        draft_time = 0.0
         for idx in range(max_length):
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens = draft_tokens.to(input_ids.device)
 
             # Target model forward, get logits
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
@@ -267,6 +277,8 @@ class EagleModel(nn.Module):
                 input_ids,
                 retrieve_indices,
             )
+            torch.cuda.synchronize()
+            target_time += time.perf_counter() - t0
 
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
             candidates = draft_tokens[0, retrieve_indices]
@@ -278,6 +290,8 @@ class EagleModel(nn.Module):
             accept_lengths.append(accept_length)
 
             # Adjusting the input sequence, draft model forward
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
             (
                 input_ids,
                 draft_tokens,
@@ -301,6 +315,8 @@ class EagleModel(nn.Module):
                 hidden_state_new,
                 sample_p,
             )
+            torch.cuda.synchronize()
+            draft_time += time.perf_counter() - t0
 
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
@@ -316,7 +332,7 @@ class EagleModel(nn.Module):
         if not log:
             return input_ids
         else:
-            return input_ids, new_token, idx, accept_lengths
+            return input_ids, new_token, idx, accept_lengths, target_time, draft_time
 
     @torch.no_grad()
     def naivegenerate(
