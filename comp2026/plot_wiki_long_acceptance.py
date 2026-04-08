@@ -50,13 +50,13 @@ def label_from_file(f):
     return name.replace("llama_3_1_8b_instruct_", "").split("_temperature")[0]
 
 
-CATEGORY_ORDER = ["long_context_1k", "long_context_2k", "long_context_4k", "long_context_8k"]
-CATEGORY_LABELS = {"long_context_1k": "1k", "long_context_2k": "2k", "long_context_4k": "4k", "long_context_8k": "8k"}
-CATEGORY_COLORS = {"long_context_1k": "#4C72B0", "long_context_2k": "#DD8452", "long_context_4k": "#55A868", "long_context_8k": "#C44E52"}
+CATEGORY_ORDER = ["long_context_1k", "long_context_2k", "long_context_4k", "long_context_8k", "long_context_16k", "long_context_32k", "long_context_64k"]
+CATEGORY_LABELS = {"long_context_1k": "1k", "long_context_2k": "2k", "long_context_4k": "4k", "long_context_8k": "8k", "long_context_16k": "16k", "long_context_32k": "32k", "long_context_64k": "64k"}
+CATEGORY_COLORS = {"long_context_1k": "#4C72B0", "long_context_2k": "#DD8452", "long_context_4k": "#55A868", "long_context_8k": "#C44E52", "long_context_16k": "#8172B2", "long_context_32k": "#937860", "long_context_64k": "#DA8BC3"}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot per-category cumulative acceptance rate for wiki_long")
+    parser = argparse.ArgumentParser(description="Plot per-category cumulative acceptance rate for WikiLong")
     parser.add_argument("--data-dir", type=str, default="wiki_long/")
     parser.add_argument("--question-file", type=str, default="wiki_long/question.jsonl")
     parser.add_argument("--output", type=str, default="wiki_long/acceptance_rate_per_position.png")
@@ -73,22 +73,32 @@ def main():
         data = load_jsonl(f)
         model_label = label_from_file(f)
 
-        # Group data by category
+        # Group data by category, count OOMs
         cat_data = defaultdict(list)
+        cat_oom = defaultdict(int)
         for dp in data:
             qid = dp["question_id"]
             cat = qid_to_cat.get(qid)
-            if cat is not None:
+            if cat is None:
+                continue
+            if dp.get("skipped") == "OOM":
+                cat_oom[cat] += 1
+            else:
                 cat_data[cat].append(dp)
 
         for cat in CATEGORY_ORDER:
             if cat not in cat_data:
+                # Full OOM — add legend entry noting OOM
+                if cat_oom.get(cat, 0) > 0:
+                    ax.plot([], [], marker="None", color=CATEGORY_COLORS[cat], linestyle="None",
+                            label=f"{CATEGORY_LABELS[cat]} (OOM)")
                 continue
             counts = aggregate_acceptance_lengths(cat_data[cat])
             last_nonzero = np.max(np.nonzero(counts)) + 1 if np.any(counts) else 1
             counts = counts[:last_nonzero]
             rate = cumulative_acceptance_rate(counts)
-            ax.plot(range(len(rate)), rate, marker="o", label=CATEGORY_LABELS[cat], color=CATEGORY_COLORS[cat])
+            ax.plot(range(len(rate)), rate, marker="o",
+                    label=CATEGORY_LABELS[cat], color=CATEGORY_COLORS[cat])
 
         ax.set_xlabel("Position")
         ax.set_ylabel("Acceptance Rate")

@@ -369,10 +369,15 @@ class LlamaModel(LlamaPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # [MODIFIED] Force explicit mask creation when tree_mask is active.
-        # Without an explicit attention_mask, SDPA/Flash may use is_causal=True
-        # optimization which doesn't support non-standard tree attention patterns.
-        if hasattr(self, "tree_mask") and self.tree_mask is not None and attention_mask is None:
+        # [MODIFIED] When tree_mask is active, fall back to SDPA for this forward pass.
+        # Flash Attention doesn't support arbitrary 4D masks needed for tree verification.
+        # Tree steps have small token counts so SDPA's O(n²) is fine there.
+        _tree_active = hasattr(self, "tree_mask") and self.tree_mask is not None
+        if _tree_active:
+            _orig_attn_impl = self.config._attn_implementation
+            self.config._attn_implementation = "sdpa"
+
+        if _tree_active and attention_mask is None:
             attention_mask = torch.ones(
                 (inputs_embeds.shape[0], cache_position[-1].item() + 1),
                 dtype=torch.bool,
@@ -389,8 +394,7 @@ class LlamaModel(LlamaPreTrainedModel):
         )
 
         # [MODIFIED] Apply tree mask overlay for speculative decoding
-        if hasattr(self, "tree_mask") and self.tree_mask is not None and causal_mask is not None:
-            # create_causal_mask may return a bool mask; convert to float for tree mask overlay
+        if _tree_active and causal_mask is not None:
             if causal_mask.dtype == torch.bool:
                 causal_mask = torch.zeros_like(causal_mask, dtype=inputs_embeds.dtype).masked_fill_(
                     ~causal_mask, torch.finfo(inputs_embeds.dtype).min
@@ -418,6 +422,9 @@ class LlamaModel(LlamaPreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+
+        if _tree_active:
+            self.config._attn_implementation = _orig_attn_impl
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(

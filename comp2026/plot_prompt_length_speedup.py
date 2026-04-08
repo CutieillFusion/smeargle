@@ -8,6 +8,9 @@ import numpy as np
 from transformers import AutoTokenizer
 
 
+CATEGORY_ORDER = ["long_context_1k", "long_context_2k", "long_context_4k", "long_context_8k", "long_context_16k", "long_context_32k", "long_context_64k"]
+
+
 def load_questions(question_file):
     """Build question_id -> category mapping."""
     mapping = {}
@@ -31,14 +34,19 @@ def compute_speeds_by_category(data, qid_to_cat, tokenizer=None):
 
     If tokenizer is provided (baseline), count tokens from answer text.
     Otherwise (spec models), use new_tokens field.
+    Returns (speeds_dict, oom_counts_dict).
     """
     cat_tokens = defaultdict(float)
     cat_time = defaultdict(float)
+    cat_oom = defaultdict(int)
 
     for dp in data:
         qid = dp["question_id"]
         cat = qid_to_cat.get(qid)
         if cat is None:
+            continue
+        if dp.get("skipped") == "OOM":
+            cat_oom[cat] += 1
             continue
         wall_time = sum(dp["choices"][0]["wall_time"])
         if tokenizer is not None:
@@ -53,11 +61,11 @@ def compute_speeds_by_category(data, qid_to_cat, tokenizer=None):
     speeds = {}
     for cat in cat_tokens:
         speeds[cat] = cat_tokens[cat] / cat_time[cat]
-    return speeds
+    return speeds, dict(cat_oom)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot per-category speedup for wiki_long benchmark")
+    parser = argparse.ArgumentParser(description="Plot per-category speedup for WikiLong")
     parser.add_argument("--data-dir", type=str, default="wiki_long/")
     parser.add_argument("--question-file", type=str, default="wiki_long/question.jsonl")
     parser.add_argument("--tokenizer-path", type=str, default="../models/llama_3_1_8b_instruct")
@@ -65,7 +73,7 @@ def main():
     args = parser.parse_args()
 
     qid_to_cat = load_questions(args.question_file)
-    categories = sorted(set(qid_to_cat.values()))
+    categories = [c for c in CATEGORY_ORDER if c in set(qid_to_cat.values())]
 
     data_dir = Path(args.data_dir)
     jsonl_files = sorted(data_dir.glob("*.jsonl"))
@@ -87,10 +95,11 @@ def main():
 
     # Compute baseline speeds per category
     baseline_data = load_jsonl(baseline_file)
-    baseline_speeds = compute_speeds_by_category(baseline_data, qid_to_cat, tokenizer=tokenizer)
+    baseline_speeds, _ = compute_speeds_by_category(baseline_data, qid_to_cat, tokenizer=tokenizer)
 
     # Compute speeds for all models (including baseline for verification)
     model_speeds = {}
+    model_ooms = {}
     # Extract a nice label from filename
     def label_from_file(f):
         name = f.stem
@@ -99,10 +108,12 @@ def main():
         return parts
 
     model_speeds[label_from_file(baseline_file)] = baseline_speeds
+    model_ooms[label_from_file(baseline_file)] = {}
     for f in spec_files:
         data = load_jsonl(f)
-        speeds = compute_speeds_by_category(data, qid_to_cat, tokenizer=None)
+        speeds, oom_counts = compute_speeds_by_category(data, qid_to_cat, tokenizer=None)
         model_speeds[label_from_file(f)] = speeds
+        model_ooms[label_from_file(f)] = oom_counts
 
     # Compute speedup ratios for spec models only (exclude baseline)
     spec_names = [m for m in model_speeds if m != label_from_file(baseline_file)]
@@ -110,27 +121,48 @@ def main():
     for model in spec_names:
         speedups[model] = {}
         for cat in categories:
-            base = baseline_speeds.get(cat, 1.0)
-            speedups[model][cat] = model_speeds[model].get(cat, 0.0) / base
+            if cat not in baseline_speeds or cat not in model_speeds[model]:
+                continue
+            speedups[model][cat] = model_speeds[model][cat] / baseline_speeds[cat]
 
     # Plot line chart (similar to acceptance rate plots)
     short_labels = [c.replace("long_context_", "") for c in categories]
     x = range(len(categories))
     colors = ["#DD8452", "#55A868"]
 
-    plt.figure(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8, 5))
+    oom_vlines = []
     for i, model in enumerate(spec_names):
-        vals = [speedups[model].get(cat, 0.0) for cat in categories]
-        plt.plot(x, vals, marker="o", label=model, color=colors[i % len(colors)])
+        color = colors[i % len(colors)]
+        plot_x, plot_y = [], []
+        for j, cat in enumerate(categories):
+            if cat in speedups[model]:
+                plot_x.append(j)
+                plot_y.append(speedups[model][cat])
 
-    plt.axhline(y=1.0, color="gray", linestyle="--", linewidth=1, label="baseline (1x)")
-    plt.xlabel("Prompt Length")
-    plt.ylabel("Speedup Factor")
-    plt.title("Per-Prompt-Length Speedup (wiki_long benchmark)")
-    plt.xticks(list(x), short_labels)
-    plt.legend()
-    plt.ylim(bottom=0)
-    plt.grid(True)
+        ax.plot(plot_x, plot_y, marker="o", label=model, color=color)
+        # Track where model fully OOMs for vertical line
+        full_oom_cats = [cat for cat in categories if model_ooms[model].get(cat, 0) > 0 and cat not in speedups[model]]
+        if full_oom_cats:
+            first_full_oom_idx = categories.index(full_oom_cats[0])
+            oom_vlines.append((5, model, color))
+
+    ax.axhline(y=1.0, color="gray", linestyle="--", linewidth=1, label="baseline (1x)")
+    ax.set_xlabel("Prompt Length")
+    ax.set_ylabel("Speedup Factor")
+    ax.set_title("Per-Prompt-Length Speedup (WikiLong)")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(short_labels)
+    ax.legend()
+    ax.set_ylim(bottom=0)
+    ax.grid(True)
+
+    # Draw OOM vertical lines after axis limits are set
+    for vline_x, label, color in oom_vlines:
+        ax.axvline(x=vline_x, color=color, linestyle=":", linewidth=1.5)
+        ax.text(vline_x + 0.05, ax.get_ylim()[1] * 0.95, f"{label} OOM",
+                color=color, fontsize=8, ha="left", va="top", rotation=90)
+
     plt.tight_layout()
     plt.savefig(args.output, dpi=150)
     print(f"Saved plot to {args.output}")

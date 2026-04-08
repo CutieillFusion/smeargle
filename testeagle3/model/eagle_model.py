@@ -261,6 +261,7 @@ class EagleModel(nn.Module):
         accept_lengths = []
         target_time = 0.0
         draft_time = 0.0
+        draft_peak_mem = 0
         for idx in range(max_length):
             self.base_model.model.tree_mask = tree_mask
 
@@ -291,6 +292,8 @@ class EagleModel(nn.Module):
 
             # Adjusting the input sequence, draft model forward
             torch.cuda.synchronize()
+            mem_before = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
             t0 = time.perf_counter()
             (
                 input_ids,
@@ -317,6 +320,7 @@ class EagleModel(nn.Module):
             )
             torch.cuda.synchronize()
             draft_time += time.perf_counter() - t0
+            draft_peak_mem = max(draft_peak_mem, torch.cuda.max_memory_allocated() - mem_before)
 
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
@@ -332,7 +336,7 @@ class EagleModel(nn.Module):
         if not log:
             return input_ids
         else:
-            return input_ids, new_token, idx, accept_lengths, target_time, draft_time
+            return input_ids, new_token, idx, accept_lengths, target_time, draft_time, draft_peak_mem
 
     @torch.no_grad()
     def naivegenerate(

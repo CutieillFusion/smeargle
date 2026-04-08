@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import subprocess
+import threading
 from accelerate.utils import set_seed
 
 set_seed(0)
@@ -10,6 +12,50 @@ import numpy as np
 import time
 import shortuuid
 import torch
+
+
+class PowerMonitor:
+    """Samples GPU power in a background thread to compute energy (Joules)."""
+
+    def __init__(self, gpu_index=0, interval=0.1):
+        self.gpu_index = gpu_index
+        self.interval = interval
+        self.samples = []  # (timestamp, watts)
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _poll(self):
+        while not self._stop.is_set():
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "-i", str(self.gpu_index),
+                     "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
+                self.samples.append((time.time(), float(out)))
+            except Exception:
+                pass
+            self._stop.wait(self.interval)
+
+    def start(self):
+        self.samples.clear()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join()
+
+    def energy_joules(self):
+        if len(self.samples) < 2:
+            return 0.0
+        energy = 0.0
+        for i in range(1, len(self.samples)):
+            dt = self.samples[i][0] - self.samples[i - 1][0]
+            avg_w = (self.samples[i][1] + self.samples[i - 1][1]) / 2.0
+            energy += avg_w * dt
+        return energy
 from fastchat.llm_judge.common import load_questions
 from tqdm import tqdm
 import scipy.stats as stats
@@ -92,6 +138,7 @@ def get_model_answers(
         dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map="auto",
+        attn_implementation="flash_attention_2",
     )
 
     tokenizer = model.get_tokenizer()
@@ -170,6 +217,7 @@ def get_model_answers(
 
     for question in tqdm(questions):
         choices = []
+        skipped = False
         for i in range(num_choices):
             torch.manual_seed(i)
             messages = [
@@ -184,6 +232,8 @@ def get_model_answers(
             wall_time = []
             target_times = []
             draft_times = []
+            max_draft_peak_mem = 0
+            total_energy_joules = 0.0
             for j in range(len(question["turns"])):
                 question_turn = question["turns"][j]
                 messages.append({"role": "user", "content": question_turn})
@@ -206,23 +256,33 @@ def get_model_answers(
                 # Start Timing Inference
                 torch.cuda.synchronize()
                 start_time = time.time()
+                power_monitor = PowerMonitor(gpu_index=0, interval=0.1)
+                power_monitor.start()
 
-                result = generate(
-                    torch.as_tensor(input_ids).cuda(),
-                    temperature=temperature,
-                    log=True,
-                    is_llama3=True,
-                )
+                try:
+                    result = generate(
+                        torch.as_tensor(input_ids).cuda(),
+                        temperature=temperature,
+                        log=True,
+                        is_llama3=True,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    power_monitor.stop()
+                    torch.cuda.empty_cache()
+                    skipped = True
+                    break
 
                 # End Timing Inference
                 torch.cuda.synchronize()
+                power_monitor.stop()
                 total_time = time.time() - start_time
 
                 if use_eagle3:
-                    output_ids, new_token, idx, accept_lengths, target_model_time, draft_model_time = result
+                    output_ids, new_token, idx, accept_lengths, target_model_time, draft_model_time, draft_peak_mem = result
                 else:
                     output_ids, new_token, idx, accept_lengths = result
                     target_model_time, draft_model_time = total_time, 0.0
+                    draft_peak_mem = 0
 
                 output_ids = output_ids[0][len(input_ids[0]) :]
 
@@ -260,7 +320,13 @@ def get_model_answers(
                 wall_time.append(total_time)
                 target_times.append(target_model_time)
                 draft_times.append(draft_model_time)
+                max_draft_peak_mem = max(max_draft_peak_mem, draft_peak_mem)
+                total_energy_joules += power_monitor.energy_joules()
                 messages.append({"role": "assistant", "content": output})
+
+            torch.cuda.empty_cache()
+            if skipped:
+                break
 
             if use_eagle3:
                 # Convert accept_lengths to CPU integers for processing
@@ -299,6 +365,8 @@ def get_model_answers(
                     total_time = total_draft_time + total_target_time
                     print("eagle3 draft ratio:", total_draft_time / total_time)
                     print("eagle3 target ratio:", total_target_time / total_time)
+                    print("eagle3 draft peak memory:", max_draft_peak_mem / 1024 / 1024, "MB")
+                    print("eagle3 total energy:", total_energy_joules, "J")
                     print("=" * 60 + "\n")
                 
                 for al in accept_lengths_int:
@@ -315,6 +383,8 @@ def get_model_answers(
                     "wall_time": wall_time,
                     "target_model_time": target_times,
                     "draft_model_time": draft_times,
+                    "draft_peak_memory_bytes": max_draft_peak_mem,
+                    "energy_joules": total_energy_joules,
                     "acceptance_lengths": dict(zip(*[a.tolist() for a in np.unique(accept_lengths_int, return_counts=True)])),
                 })
             else:
@@ -329,6 +399,20 @@ def get_model_answers(
                         "draft_model_time": draft_times,
                     }
                 )
+
+        if skipped:
+            os.makedirs(os.path.dirname(answer_file), exist_ok=True)
+            with open(os.path.expanduser(answer_file), "a") as fout:
+                ans_json = {
+                    "question_id": question["question_id"],
+                    "answer_id": shortuuid.uuid(),
+                    "model_id": model_id,
+                    "choices": [],
+                    "tstamp": time.time(),
+                    "skipped": "OOM",
+                }
+                fout.write(json.dumps(ans_json) + "\n")
+            continue
 
         # Dump answers
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
