@@ -31,9 +31,6 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 from transformers import LlamaConfig
 
-# [MODIFIED] Import KVCacheAdapter for preallocated KV cache support
-from .kv_cache import KVCacheAdapter
-
 
 logger = logging.get_logger(__name__)
 
@@ -356,10 +353,6 @@ class LlamaModel(LlamaPreTrainedModel):
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        # [MODIFIED] Wrap list-based KVCache in adapter for modern Cache API compatibility
-        if past_key_values is not None and isinstance(past_key_values, list):
-            past_key_values = KVCacheAdapter(past_key_values)
 
         if inputs_embeds is None:
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)

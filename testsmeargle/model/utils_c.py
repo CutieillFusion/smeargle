@@ -173,26 +173,6 @@ def generate_tree_buffers(tree_choices, device="cuda"):
     return tree_buffers
 
 
-def reset_past_key_values(passed_key_values: List[torch.Tensor]) -> List[torch.Tensor]:
-    """
-    Resets the current lengths in the passed key-values to zero.
-
-    This function is designed to be used during the evaluation of a baseline model.
-    It iterates through each layer's key-values and sets their current lengths to zero,
-    effectively resetting their state.
-
-    Args:
-    - passed_key_values (list of torch.Tensor): Contains past hidden states and past attention values for each layer.
-
-    Returns:
-    - passed_key_values (list of torch.Tensor): Updated past hidden states and past attention values with reset lengths.
-    """
-    for i in range(len(passed_key_values)):
-        for j in range(2):
-            passed_key_values[i][j].current_length.fill_(0)
-    return passed_key_values
-
-
 if __name__ == "__main__":
     from choices import mc_sim_7b_63
 

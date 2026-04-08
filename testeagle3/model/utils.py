@@ -307,26 +307,6 @@ def reset_tree_mode(
     model.base_model.model.tree_mode = None
 
 
-def reset_past_key_values(passed_key_values: List[torch.Tensor]) -> List[torch.Tensor]:
-    """
-    Resets the current lengths in the passed key-values to zero.
-
-    This function is designed to be used during the evaluation of a baseline model.
-    It iterates through each layer's key-values and sets their current lengths to zero,
-    effectively resetting their state.
-
-    Args:
-    - passed_key_values (list of torch.Tensor): Contains past hidden states and past attention values for each layer.
-
-    Returns:
-    - passed_key_values (list of torch.Tensor): Updated past hidden states and past attention values with reset lengths.
-    """
-    for i in range(len(passed_key_values)):
-        for j in range(2):
-            passed_key_values[i][j].current_length.fill_(0)
-    return passed_key_values
-
-
 def generate_candidates(
     tree_logits, tree_indices, retrieve_indices, sample_token, logits_processor
 ):
