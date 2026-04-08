@@ -1,4 +1,64 @@
+from typing import Any, Optional
+
 import torch
+
+from transformers.cache_utils import Cache, CacheLayerMixin
+
+
+class KVCacheLayer(CacheLayerMixin):
+    """Wraps a single [key_KVCache, value_KVCache] pair as a CacheLayerMixin
+    for compatibility with the modern transformers Cache API."""
+
+    is_sliding = False
+    is_compileable = False
+
+    def __init__(self, key_cache: "KVCache", value_cache: "KVCache"):
+        # Skip CacheLayerMixin.__init__ to avoid overwriting our cache references
+        self.key_cache = key_cache
+        self.value_cache = value_cache
+        self.is_initialized = True
+
+    def lazy_initialization(self, key_states: torch.Tensor):
+        pass  # Already initialized with preallocated memory
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        cache_kwargs: Optional[dict[str, Any]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key_out = self.key_cache.cat(key_states, dim=2)
+        value_out = self.value_cache.cat(value_states, dim=2)
+        return key_out, value_out
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        kv_offset = 0
+        query_length = cache_position.shape[0]
+        kv_length = self.get_seq_length() + query_length
+        return kv_length, kv_offset
+
+    def get_seq_length(self) -> int:
+        return self.key_cache.current_length.item()
+
+    def get_max_cache_shape(self) -> int:
+        return self.key_cache.data.shape[2]  # max_length dimension
+
+
+class KVCacheAdapter(Cache):
+    """Adapts List[List[KVCache]] to the modern transformers Cache API.
+
+    The existing speculative decoding code uses preallocated KVCache objects
+    organized as a list of [key_cache, value_cache] pairs per layer. This
+    adapter wraps that structure so the modern HuggingFace modeling code
+    (which expects a Cache object) can use it transparently.
+    """
+
+    def __init__(self, kv_caches: list):
+        layer_adapters = [
+            KVCacheLayer(kv_pair[0], kv_pair[1])
+            for kv_pair in kv_caches
+        ]
+        super().__init__(layers=layer_adapters)
 
 
 class KVCache:

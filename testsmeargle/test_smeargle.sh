@@ -27,6 +27,6 @@ singularity exec --nv \
       --answer-file-path /workspace \
       --benchmark-path /datasets/wiki_long \
       --temperature 0.0 \
-      --depth 7 \
+      --depth 5 \
       --warmup-steps 3 \
       --use-smeargle"
