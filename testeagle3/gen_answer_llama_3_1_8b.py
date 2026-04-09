@@ -82,6 +82,7 @@ def run_eval(
     top_k: int,
     warmup_steps: int,
     use_eagle3: bool,
+    draft_kv_window: int = None,
 ):
     questions = load_questions(question_file, question_begin, question_end)
 
@@ -105,6 +106,7 @@ def run_eval(
             max_gpu_memory,
             model_id,
             temperature,
+            draft_kv_window=draft_kv_window,
         )
         for i in range(0, len(questions), chunk_size)
     ]
@@ -127,6 +129,7 @@ def get_model_answers(
     max_gpu_memory: str,
     model_id: str,
     temperature: float,
+    draft_kv_window: int = None,
 ):
 
     model = EagleModel.from_pretrained(
@@ -135,6 +138,7 @@ def get_model_answers(
         total_token=total_token,
         depth=depth,
         top_k=top_k,
+        draft_kv_window=draft_kv_window,
         dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map="auto",
@@ -533,12 +537,18 @@ if __name__ == "__main__":
         default="mc_sim_7b_63",
     )
     parser.add_argument("--use_eagle3", action="store_true")
+    parser.add_argument(
+        "--draft-kv-window",
+        type=int,
+        default=None,
+        help="Sliding window size for the draft model's KV cache. None means no window (default).",
+    )
 
     args = parser.parse_args()
 
     question_file = f"{args.benchmark_path}/question.jsonl"
 
-    model_id = f"{args.base_model_path.split('/')[-1]}_{'eagle3' if args.use_eagle3 else 'baseline'}_temperature_{str(args.temperature).replace('.', '_')}_{args.benchmark_path.split('/')[-1]}"
+    model_id = f"{args.base_model_path.split('/')[-1]}_{'eagle3' if args.use_eagle3 else 'baseline'}_temperature_{str(args.temperature).replace('.', '_')}_{args.benchmark_path.split('/')[-1]}{f'_window_{args.draft_kv_window}' if args.draft_kv_window is not None else ''}"
 
     answer_file = f"{args.answer_file_path}/{model_id}.jsonl"
 
@@ -561,6 +571,7 @@ if __name__ == "__main__":
         args.top_k,
         args.warmup_steps,
         args.use_eagle3,
+        draft_kv_window=args.draft_kv_window,
     )
 
     reorg_answer_file(answer_file)

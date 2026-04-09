@@ -47,7 +47,15 @@ def cumulative_acceptance_rate(counts):
 
 def label_from_file(f):
     name = f.stem
+    if "_window_" in name:
+        return name.split("_window_")[-1]
     return name.replace("llama_3_1_8b_instruct_", "").split("_temperature")[0]
+
+
+def _window_sort_key(f):
+    if "_window_" in f.name:
+        return int(f.name.split("_window_")[-1].split(".")[0])
+    return 0
 
 
 CATEGORY_ORDER = ["long_context_1k", "long_context_2k", "long_context_4k", "long_context_8k", "long_context_16k", "long_context_32k", "long_context_64k"]
@@ -60,11 +68,15 @@ def main():
     parser.add_argument("--data-dir", type=str, default="wiki_long/")
     parser.add_argument("--question-file", type=str, default="wiki_long/question.jsonl")
     parser.add_argument("--output", type=str, default="wiki_long/acceptance_rate_per_position.png")
+    parser.add_argument("--file-filter", type=str, default=None,
+                        help="Only include spec files whose filename contains this substring")
     args = parser.parse_args()
 
     qid_to_cat = load_questions(args.question_file)
     data_dir = Path(args.data_dir)
-    spec_files = sorted(f for f in data_dir.glob("*.jsonl") if "baseline" not in f.name and "temperature" in f.name)
+    spec_files = sorted((f for f in data_dir.glob("*.jsonl") if "baseline" not in f.name and "temperature" in f.name), key=_window_sort_key)
+    if args.file_filter:
+        spec_files = [f for f in spec_files if args.file_filter in f.name]
 
     fig, axes = plt.subplots(1, len(spec_files), figsize=(8 * len(spec_files), 5), squeeze=False)
 

@@ -28,6 +28,7 @@ class EagleModel(nn.Module):
         top_k: int,
         threshold: float,
         eagle_layer_state_dict: torch.Tensor,
+        draft_kv_window: int = None,
     ):
         super().__init__()
         self.base_model = base_model
@@ -56,6 +57,7 @@ class EagleModel(nn.Module):
             top_k=top_k,
             threshold=threshold,
             path=base_model_name_or_path,
+            draft_kv_window=draft_kv_window,
         )
 
         low_memory = False
@@ -101,6 +103,7 @@ class EagleModel(nn.Module):
         depth: int = 7,
         top_k: int = 10,
         threshold: float = 1.0,
+        draft_kv_window: int = None,
         **kwargs,
     ):
         Type = AutoConfig.from_pretrained(base_model_path).architectures[0]
@@ -145,6 +148,7 @@ class EagleModel(nn.Module):
             top_k,
             threshold,
             eagle_layer_state_dict,
+            draft_kv_window=draft_kv_window,
         )
 
         # If total_token is -1, find the optimal total_token by measuring the inference time

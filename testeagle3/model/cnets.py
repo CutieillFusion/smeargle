@@ -370,7 +370,11 @@ class LlamaAttention(nn.Module):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # Ensure RoPE cache covers max position_id (may exceed kv_seq_len with sliding window)
+        rope_seq_len = kv_seq_len
+        if position_ids is not None:
+            rope_seq_len = max(rope_seq_len, position_ids.max().item() + 1)
+        cos, sin = self.rotary_emb(value_states, seq_len=rope_seq_len)
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin, position_ids
         )
@@ -577,9 +581,11 @@ class Model(nn.Module):
         depth=5,
         top_k=8,
         threshold=1.0,
+        draft_kv_window=None,
     ):
         super().__init__()
         self.config = config
+        self.draft_kv_window = draft_kv_window
         self.gradient_checkpointing = True
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -784,6 +790,7 @@ class Model(nn.Module):
 
     def reset_kv(self):
         self.stable_kv = None
+        self.stable_kv_logical_len = 0
 
     @torch.no_grad()
     def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
@@ -806,24 +813,51 @@ class Model(nn.Module):
         self.reset()
 
 
-        # print("hidden_states shape", hidden_states.shape)
-        # print("input_ids shape", input_ids.shape)
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
-            kv_len = self.stable_kv[0][0].shape[2]
-            out_hidden, past_key_values = self(
-                hidden_states,
-                input_ids=input_ids[:, kv_len:],
-                past_key_values=self.stable_kv,
-                use_cache=True,
-            )
+            if self.draft_kv_window is not None:
+                # Use logical length (pre-truncation) to slice input_ids correctly
+                kv_len = self.stable_kv_logical_len
+                new_input_ids = input_ids[:, kv_len:]
+                # Pass explicit position_ids since physical KV length != logical length
+                position_ids = torch.arange(
+                    kv_len, kv_len + new_input_ids.shape[1],
+                    dtype=torch.long, device=hidden_states.device,
+                ).unsqueeze(0)
+                out_hidden, past_key_values = self(
+                    hidden_states,
+                    input_ids=new_input_ids,
+                    past_key_values=self.stable_kv,
+                    position_ids=position_ids,
+                    use_cache=True,
+                )
+            else:
+                kv_len = self.stable_kv[0][0].shape[2]
+                out_hidden, past_key_values = self(
+                    hidden_states,
+                    input_ids=input_ids[:, kv_len:],
+                    past_key_values=self.stable_kv,
+                    use_cache=True,
+                )
         else:
             out_hidden, past_key_values = self(
                 hidden_states, input_ids=input_ids, use_cache=True
             )
-        # print("out_hidden shape", out_hidden.shape)
-        # print("past_key_values shape", past_key_values[0][0].shape)
-        
+
         self.stable_kv = past_key_values
+        # Track logical length: for the first call it's the full KV size;
+        # for subsequent calls, add the number of new tokens processed
+        if self.stable_kv_logical_len == 0:
+            self.stable_kv_logical_len = past_key_values[0][0].shape[2]
+        else:
+            self.stable_kv_logical_len += hidden_states.shape[1]
+        # Sliding window: truncate draft KV cache to last N positions
+        if self.draft_kv_window is not None:
+            kv_len = self.stable_kv[0][0].shape[2]
+            if kv_len > self.draft_kv_window:
+                self.stable_kv = tuple(
+                    tuple(t[:, :, -self.draft_kv_window:, :] for t in layer)
+                    for layer in self.stable_kv
+                )
         # Apply norm to match training, where normed hidden states flow into next depth
         last_hidden = self.norm(out_hidden[:, -1])
 

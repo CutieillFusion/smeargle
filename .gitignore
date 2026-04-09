@@ -39,3 +39,5 @@ models/*
 !rosie2026/*.jsonl
 !comp2026/*/*.jsonl
 !comp2026/*.jsonl
+
+comp2026/.claude/*

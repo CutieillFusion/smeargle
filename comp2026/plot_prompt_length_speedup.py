@@ -70,6 +70,8 @@ def main():
     parser.add_argument("--question-file", type=str, default="wiki_long/question.jsonl")
     parser.add_argument("--tokenizer-path", type=str, default="../models/llama_3_1_8b_instruct")
     parser.add_argument("--output", type=str, default="wiki_long/category_speedup.png")
+    parser.add_argument("--file-filter", type=str, default=None,
+                        help="Only include spec files whose filename contains this substring")
     args = parser.parse_args()
 
     qid_to_cat = load_questions(args.question_file)
@@ -80,12 +82,29 @@ def main():
 
     # Identify baseline and spec model files
     baseline_file = None
+    # Extract a nice label from filename
+    def label_from_file(f):
+        name = f.stem
+        if "_window_" in name:
+            return name.split("_window_")[-1]
+        # e.g. llama_3_1_8b_instruct_eagle3_temperature_0.0 -> eagle3
+        parts = name.replace("llama_3_1_8b_instruct_", "").split("_temperature")[0]
+        return parts
+
+    def _window_sort_key(f):
+        if "_window_" in f.name:
+            return int(f.name.split("_window_")[-1].split(".")[0])
+        return 0
+
     spec_files = []
     for f in jsonl_files:
         if "baseline" in f.name:
             baseline_file = f
         elif "temperature" in f.name:
             spec_files.append(f)
+    spec_files.sort(key=_window_sort_key)
+    if args.file_filter:
+        spec_files = [f for f in spec_files if args.file_filter in f.name]
 
     if baseline_file is None:
         raise FileNotFoundError("No baseline JSONL file found in " + str(data_dir))
@@ -100,12 +119,6 @@ def main():
     # Compute speeds for all models (including baseline for verification)
     model_speeds = {}
     model_ooms = {}
-    # Extract a nice label from filename
-    def label_from_file(f):
-        name = f.stem
-        # e.g. llama_3_1_8b_instruct_eagle3_temperature_0.0 -> eagle3
-        parts = name.replace("llama_3_1_8b_instruct_", "").split("_temperature")[0]
-        return parts
 
     model_speeds[label_from_file(baseline_file)] = baseline_speeds
     model_ooms[label_from_file(baseline_file)] = {}
@@ -128,7 +141,7 @@ def main():
     # Plot line chart (similar to acceptance rate plots)
     short_labels = [c.replace("long_context_", "") for c in categories]
     x = range(len(categories))
-    colors = ["#DD8452", "#55A868"]
+    colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2", "#937860", "#DA8BC3", "#8C8C8C", "#CCB974"]
 
     fig, ax = plt.subplots(figsize=(8, 5))
     oom_vlines = []
@@ -157,11 +170,15 @@ def main():
     ax.set_ylim(bottom=0)
     ax.grid(True)
 
-    # Draw OOM vertical lines after axis limits are set
+    # Draw OOM vertical lines after axis limits are set (one per x-position)
+    seen_oom_x = set()
     for vline_x, label, color in oom_vlines:
-        ax.axvline(x=vline_x, color=color, linestyle=":", linewidth=1.5)
-        ax.text(vline_x + 0.05, ax.get_ylim()[1] * 0.95, f"{label} OOM",
-                color=color, fontsize=8, ha="left", va="top", rotation=90)
+        if vline_x in seen_oom_x:
+            continue
+        seen_oom_x.add(vline_x)
+        ax.axvline(x=vline_x, color="red", linestyle=":", linewidth=1.5)
+        ax.text(vline_x + 0.05, ax.get_ylim()[1] * 0.95, "OOM",
+                color="red", fontsize=8, ha="left", va="top", rotation=90)
 
     plt.tight_layout()
     plt.savefig(args.output, dpi=150)

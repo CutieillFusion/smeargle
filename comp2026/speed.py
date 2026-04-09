@@ -21,6 +21,8 @@ with open(jsonl_file, "r", encoding="utf-8") as file:
 
 speeds = []
 for datapoint in data:
+    if not datapoint["choices"]:
+        continue
     qid = datapoint["question_id"]
     answer = datapoint["choices"][0]["turns"]
     tokens = sum(datapoint["choices"][0]["new_tokens"])
