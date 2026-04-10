@@ -27,11 +27,11 @@ singularity exec --nv \
     export PATH=\$CUDA_HOME/bin:\$PATH && \
     export LD_LIBRARY_PATH=\$CUDA_HOME/lib64:\$LD_LIBRARY_PATH && \
     uv sync && \
-    .venv/bin/python .venv/bin/deepspeed --master_port 29002 main.py \
+    .venv/bin/python .venv/bin/deepspeed --master_port 29000 main.py \
       --deepspeed_config ds_config.json \
       --basepath /models/llama_3_1_8b_instruct \
-      --trainpath /datasets/perfect_blend/train_regen.jsonl \
-      --testpath /datasets/perfect_blend/test_regen.jsonl \
-      --epochs 10 \
+      --trainpath /datasets/train_5k.jsonl \
+      --testpath /datasets/test_5k.jsonl \
+      --epochs 1 \
       --savedir $SAVEDIR
   "

@@ -30,6 +30,7 @@ from transformers.activations import ACT2FN
 from transformers import AutoTokenizer
 from modeling_llama import LlamaForCausalLM
 from configs import EagleConfig
+from triton_loss import LogSoftmaxLoss
 from safetensors import safe_open
 from datasets import load_dataset
 import multiprocessing
@@ -697,6 +698,8 @@ class Model(nn.Module):
         padded_target = F.pad(target, (0, 0, 0, self.length - 1), value=0.0)
         padded_loss_mask = F.pad(loss_mask, (0, 0, 0, self.length - 1), value=0.0)
 
+        all_embeds = self.embed_tokens(padded_input_ids).to(hidden_states.dtype)
+
         with torch.no_grad():
             all_position_mask = []
             all_target_head = []
@@ -716,9 +719,7 @@ class Model(nn.Module):
         acces = []
         for idx in range(self.length):
 
-            cur_input_ids = padded_input_ids[:, idx:idx + seq_length]
-            inputs_embeds = self.embed_tokens(cur_input_ids)
-            inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+            inputs_embeds = all_embeds[:, idx:idx + seq_length]
 
             hidden_states = self.midlayer(
                 input_emb=inputs_embeds,
@@ -737,14 +738,10 @@ class Model(nn.Module):
 
             target_p = nn.Softmax(dim=2)(all_target_head[idx].float())
             position_mask = all_position_mask[idx]
-
-            out_logp = nn.LogSoftmax(dim=2)(logits)
-            plogp = target_p * out_logp
-            sum_logit = torch.sum(position_mask * plogp, 2)
-            loss = -sum_logit.mean()
+            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
 
             plosses.append(loss)
-        
+
             acc_num = ((logits.argmax(-1) == all_target_p_argmax[idx]) * position_mask.squeeze(-1)).sum()
             acc_den = padded_loss_mask[:, idx:idx + seq_length].sum() + 1e-6
             acces.append(acc_num / acc_den)

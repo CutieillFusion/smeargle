@@ -30,6 +30,7 @@ from transformers.activations import ACT2FN
 from transformers import AutoTokenizer
 from modeling_llama import LlamaForCausalLM
 from configs import SmeargleConfig
+from triton_loss import LogSoftmaxLoss
 from safetensors import safe_open
 from datasets import load_dataset
 import multiprocessing
@@ -178,12 +179,6 @@ def merge_dicts(dicts):
         result.update(d)
     return result
 
-
-@torch.compile(mode="max-autotune-no-cudagraphs")
-def _compute_loss(logits, target_p, position_mask):
-    out_logp = F.log_softmax(logits, dim=2)
-    plogp = target_p * out_logp
-    return -torch.sum(position_mask * plogp, 2).mean()
 
 
 class Model(nn.Module):
@@ -453,6 +448,8 @@ class Model(nn.Module):
         padded_target = F.pad(target, (0, 0, 0, self.length - 1), value=0.0)
         padded_loss_mask = F.pad(loss_mask, (0, 0, 0, self.length - 1), value=0.0)
 
+        all_embeds = self.embed_tokens(padded_input_ids).to(hidden_states.dtype)
+
         with torch.no_grad():
             all_position_mask = []
             all_target_p = []
@@ -473,9 +470,7 @@ class Model(nn.Module):
         acces = []
         for idx in range(self.length):
 
-            cur_input_ids = padded_input_ids[:, idx:idx + seq_length]
-            inputs_embeds = self.embed_tokens(cur_input_ids)
-            inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+            inputs_embeds = all_embeds[:, idx:idx + seq_length]
 
             hidden_states = self.midlayer(
                 input_emb=inputs_embeds,
@@ -490,7 +485,7 @@ class Model(nn.Module):
             target_p = all_target_p[idx]
             position_mask = all_position_mask[idx]
 
-            loss = _compute_loss(logits, target_p, position_mask)
+            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
 
             plosses.append(loss)
 
