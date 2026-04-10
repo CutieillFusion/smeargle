@@ -4,7 +4,7 @@ import json
 import re
 import os
 import torch
-from cnets import Model
+from modeling_llama3_eagle3 import Eagle3
 from configs import SmeargleConfig
 from datasets import load_dataset
 from typing import Any, Dict, List
@@ -208,7 +208,7 @@ traindataset = build_dataset_rank(tokenizer, args.trainpath)
 testdataset = build_dataset_rank(tokenizer, args.testpath)
 
 config = SmeargleConfig.from_pretrained(train_config["config_path"])
-model = Model(
+model = Eagle3(
     config, train_config, path=args.basepath
 )
 model.scandata(args.trainpath, args.basepath, args.local_rank)
