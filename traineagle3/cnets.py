@@ -390,6 +390,32 @@ def merge_dicts(dicts):
     return result
 
 
+def _find_subsequence(seq, pattern):
+    indices = []
+    plen = len(pattern)
+    for i in range(len(seq) - plen + 1):
+        if seq[i:i + plen] == pattern:
+            indices.append(i)
+    return indices
+
+
+def _compute_assistant_loss_mask(input_ids_list, assistant_header_ids, eot_ids):
+    seq = input_ids_list
+    mask = [0] * len(seq)
+    header_starts = _find_subsequence(seq, assistant_header_ids)
+    header_len = len(assistant_header_ids)
+    for hs in header_starts:
+        response_start = hs + header_len
+        eot_starts = _find_subsequence(seq[response_start:], eot_ids)
+        if eot_starts:
+            response_end = response_start + eot_starts[0]
+        else:
+            response_end = len(seq)
+        for j in range(response_start, response_end):
+            mask[j] = 1
+    return mask
+
+
 class Model(nn.Module):
     def __init__(
         self,
@@ -494,6 +520,11 @@ class Model(nn.Module):
             original_columns1 = dataset.column_names
             num_proc = 48
 
+            assistant_header_ids = tokenizer.encode(
+                "<|start_header_id|>assistant<|end_header_id|>\n\n", add_special_tokens=False
+            )
+            eot_ids = tokenizer.encode("<|eot_id|>", add_special_tokens=False)
+
             def preprocess_function(examples):
                 new_examples = {
                     "input_ids": [],
@@ -531,44 +562,13 @@ class Model(nn.Module):
                         return_tensors="pt",
                         add_special_tokens=False,
                     ).input_ids[0]
-                    # When construct draft model vocab,
-                    # filter out samples which is longer than max_len,
-                    # instead of truncating them.
                     if len(input_ids) > self.train_config["max_len"]:
                         continue
-                    loss_mask = torch.ones_like(input_ids)
 
-                    sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-
-                    sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
-                    turns = conversation.split(sep2)
-
-                    turns[1] = turns[0] + sep2 + turns[1]
-                    turns = turns[1:]
-
-                    cur_len = 1
-                    loss_mask[:cur_len] = 0
-                    for i, turn in enumerate(turns):
-                        if turn == "":
-                            break
-                        turn_len = len(tokenizer(turn).input_ids)
-
-                        parts = turn.split(sep)
-                        if len(parts) != 2:
-                            break
-                        parts[0] += sep
-                        # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
-                        instruction_len = len(tokenizer(parts[0]).input_ids) - 1
-
-                        if i == 0:
-                            loss_mask[cur_len : cur_len + instruction_len - 2] = 0
-                        else:
-                            loss_mask[cur_len - 3 : cur_len + instruction_len + 1] = 0
-                        cur_len += turn_len
-                        if i != 0:
-                            cur_len += 3
-
-                    loss_mask[cur_len:] = 0
+                    loss_mask_list = _compute_assistant_loss_mask(
+                        input_ids.tolist(), assistant_header_ids, eot_ids
+                    )
+                    loss_mask = torch.tensor(loss_mask_list, dtype=input_ids.dtype)
 
                     new_examples["input_ids"].append(input_ids[None, :])
                     new_examples["loss_mask"].append(loss_mask[None, :])
@@ -708,8 +708,6 @@ class Model(nn.Module):
 
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        self.t2d = self.t2d.to(hidden_states.device)
-
         self.midlayer.gradient_checkpointing = False
 
         padded_input_ids = F.pad(input_ids, (0, self.length - 1), value=0)
@@ -754,9 +752,8 @@ class Model(nn.Module):
             logits = self.lm_head(hidden_states)
             logits = logits.float()
 
-            target_p = nn.Softmax(dim=2)(all_target_head[idx].float())
             position_mask = all_position_mask[idx]
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            loss = LogSoftmaxLoss.apply(logits, all_target_head[idx].float(), position_mask)
 
             plosses.append(loss)
 

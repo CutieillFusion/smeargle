@@ -9,6 +9,7 @@ from configs import SmeargleConfig
 from datasets import load_dataset
 from typing import Any, Dict, List
 from torch import optim
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -62,12 +63,48 @@ train_config = {
     "gradient_checkpoint": True,
 }
 
+def find_subsequence(seq, pattern):
+    """Find all start indices of pattern in seq."""
+    indices = []
+    plen = len(pattern)
+    for i in range(len(seq) - plen + 1):
+        if seq[i:i + plen] == pattern:
+            indices.append(i)
+    return indices
+
+
+def compute_assistant_loss_mask(input_ids_list, assistant_header_ids, eot_ids):
+    """Token-ID based loss mask: only compute loss on assistant response tokens."""
+    seq = input_ids_list
+    mask = [0] * len(seq)
+    header_starts = find_subsequence(seq, assistant_header_ids)
+    header_len = len(assistant_header_ids)
+
+    for hs in header_starts:
+        response_start = hs + header_len
+        eot_starts = find_subsequence(seq[response_start:], eot_ids)
+        if eot_starts:
+            response_end = response_start + eot_starts[0]
+        else:
+            response_end = len(seq)
+        for j in range(response_start, response_end):
+            mask[j] = 1
+
+    return mask
+
+
 def build_dataset_rank(tokenizer, datapath):
 
     ds = load_dataset("json", data_files=datapath)
     ds = ds["train"]
     ds = ds.shuffle(seed=42)
     num_proc = 48
+
+    # Pre-compute token patterns for loss mask (robust, tokenizer-agnostic)
+    assistant_header_ids = tokenizer.encode(
+        "<|start_header_id|>assistant<|end_header_id|>\n\n", add_special_tokens=False
+    )
+    eot_ids = tokenizer.encode("<|eot_id|>", add_special_tokens=False)
 
     def preprocess_function(examples):
         new_examples = {"attention_mask": [], "input_ids": [], "loss_mask": []}
@@ -86,7 +123,6 @@ def build_dataset_rank(tokenizer, datapath):
                 continue
 
             if roles[source[0]["from"]] != "user":
-                # Skip the first one if it is not from human
                 source = source[1:]
 
             for j, sentence in enumerate(source):
@@ -109,44 +145,13 @@ def build_dataset_rank(tokenizer, datapath):
                 add_special_tokens=False,
             ).input_ids[0]
 
-            # filtering out the samples which is longer than max_len
             if len(input_ids) > train_config["max_len"]:
                 continue
 
-            loss_mask = torch.ones_like(input_ids)
-
-            sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-
-            sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
-            turns = conversation.split(sep2)
-
-            turns[1] = turns[0] + sep2 + turns[1]
-            turns = turns[1:]
-
-            cur_len = 1
-            loss_mask[:cur_len] = 0
-            for i, turn in enumerate(turns):
-                if turn == "":
-                    break
-                turn_len = len(tokenizer(turn).input_ids)
-
-                parts = turn.split(sep)
-                if len(parts) != 2:
-                    break
-                parts[0] += sep
-                # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
-                instruction_len = len(tokenizer(parts[0]).input_ids) - 1
-
-                # Ignore the user instructions
-                if i == 0:
-                    loss_mask[cur_len : cur_len + instruction_len - 2] = 0
-                else:
-                    loss_mask[cur_len - 3 : cur_len + instruction_len + 1] = 0
-                cur_len += turn_len
-                if i != 0:
-                    cur_len += 3
-
-            loss_mask[cur_len:] = 0
+            loss_mask_list = compute_assistant_loss_mask(
+                input_ids.tolist(), assistant_header_ids, eot_ids
+            )
+            loss_mask = torch.tensor(loss_mask_list, dtype=input_ids.dtype)
             attention_mask = torch.ones_like(loss_mask)
 
             new_examples["input_ids"].append(input_ids[None, :])
@@ -214,15 +219,11 @@ _ = model._target_model
 num_epochs = train_config["num_epochs"]
 
 # Create PyTorch AdamW optimizer manually to bypass DeepSpeed's FusedAdam (which fails on compute_90)
-# Extract optimizer params from ds_config
 opt_params = ds_config["optimizer"]["params"]
-optimizer = optim.AdamW(
+max_lr = 5e-5
+raw_optimizer = optim.AdamW(
     model.parameters(),
-    lr=(
-        opt_params["lr"]
-        if opt_params["lr"] > 0
-        else ds_config["scheduler"]["params"]["warmup_max_lr"]
-    ),
+    lr=max_lr,
     betas=tuple(opt_params["betas"]),
     weight_decay=opt_params["weight_decay"],
     eps=1e-8,
@@ -231,7 +232,7 @@ optimizer = optim.AdamW(
 model_engine, optimizer, _, _ = deepspeed.initialize(
     args=args,
     model=model,
-    optimizer=optimizer,
+    optimizer=raw_optimizer,
     model_parameters=model.parameters(),
 )
 
@@ -266,6 +267,18 @@ train_loader = DataLoader(
     collate_fn=DataCollatorWithPadding(),
 )
 
+# Cosine annealing with linear warmup (SpecForge/TorchSpec style)
+# Uses the raw optimizer reference (before DeepSpeed wrapping) for PyTorch schedulers
+grad_accum = ds_config.get("gradient_accumulation_steps", 1)
+steps_per_epoch = len(train_loader) // grad_accum
+total_steps = steps_per_epoch * num_epochs
+warmup_ratio = 0.015
+warmup_steps = max(1, int(total_steps * warmup_ratio))
+
+warmup_scheduler = LinearLR(raw_optimizer, start_factor=1e-6 / max_lr, total_iters=warmup_steps)
+cosine_scheduler = CosineAnnealingLR(raw_optimizer, T_max=total_steps - warmup_steps, eta_min=1e-6)
+lr_scheduler = SequentialLR(raw_optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+
 
 def find_max_state_with_file(directory, filename="zero_to_fp32.py"):
     max_a = -1
@@ -293,15 +306,23 @@ def print_rank(message: str):
     if global_rank == 0:
         print(message)
 
-def reduce_and_print(epoch_metrics: list[list[float]], mode: str, metric_name: str, epoch: int) -> float:
-    total_metric = 0
+def reduce_and_print(epoch_metrics: list[list[float]], mode: str, metric_name: str, epoch: int) -> list[float]:
+    reduced = []
     for i, metric in enumerate(epoch_metrics):
         metric = torch.tensor(metric).cuda().mean()
         torch.cuda.empty_cache()
         deepspeed.comm.all_reduce(metric, op=deepspeed.comm.ReduceOp.AVG)
         print_rank(f"{mode} Epoch [{epoch + 1}/{num_epochs}], position {i}, {metric_name}: {metric.item():.2f}")
-        total_metric += metric.item()
-    return total_metric / len(epoch_metrics)
+        reduced.append(metric.item())
+    return reduced
+
+def simulated_acceptance_length(acces: list[float]) -> float:
+    cumulative = 1.0
+    acc_length = 0.0
+    for a in acces:
+        cumulative *= a
+        acc_length += cumulative
+    return acc_length
 
 best_test_ploss = float("inf")
 patience_counter = 0
@@ -335,14 +356,17 @@ for epoch in range(start_epoch, num_epochs):
         model_engine.backward(loss)
 
         model_engine.step()
+        if model_engine.is_gradient_accumulation_boundary():
+            lr_scheduler.step()
 
         epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
         epoch_plosses = [
             epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
         ]
 
-    reduce_and_print(epoch_acces, "Train", "Acc", epoch)
+    train_acces = reduce_and_print(epoch_acces, "Train", "Acc", epoch)
     reduce_and_print(epoch_plosses, "Train", "pLoss", epoch)
+    print_rank(f"Train Epoch [{epoch + 1}/{num_epochs}], Simulated Acceptance Length: {simulated_acceptance_length(train_acces):.2f}")
 
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
@@ -361,8 +385,11 @@ for epoch in range(start_epoch, num_epochs):
                 epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
             ]
 
-    reduce_and_print(epoch_acces, "Test", "Acc", epoch)
-    test_ploss = reduce_and_print(epoch_plosses, "Test", "pLoss", epoch)
+    test_acces = reduce_and_print(epoch_acces, "Test", "Acc", epoch)
+    test_plosses = reduce_and_print(epoch_plosses, "Test", "pLoss", epoch)
+    test_ploss = sum(test_plosses) / len(test_plosses)
+    test_acc_length = simulated_acceptance_length(test_acces)
+    print_rank(f"Test Epoch [{epoch + 1}/{num_epochs}], Simulated Acceptance Length: {test_acc_length:.2f}")
 
     # Early stopping based on test pLoss on average test position loss
     if args.patience is not None:

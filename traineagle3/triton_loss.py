@@ -46,6 +46,8 @@ def log_softmax_forward_kernel(
     loss_stride,
     m_ptr,
     d_ptr,
+    tm_ptr,
+    td_ptr,
     n_cols,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -57,6 +59,7 @@ def log_softmax_forward_kernel(
     if position_mask == 0:
         return
 
+    # Pass 1: draft logits max and sum-of-exp
     m = float("-inf")
     d = 0.0
 
@@ -73,28 +76,50 @@ def log_softmax_forward_kernel(
         )
         m = m_new
 
+    # Pass 2: target logits max and sum-of-exp (on-the-fly softmax)
+    tm = float("-inf")
+    td = 0.0
+
+    for i in range(0, n_cols, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        target_block = tl.load(
+            target_ptr + offsets, mask=mask, other=float("-inf")
+        ).cast(tl.float32)
+        block_max = tl.max(tl.where(mask, target_block, float("-inf")))
+        tm_new = tl.maximum(tm, block_max)
+        td = td * tl.exp(tm - tm_new) + tl.sum(
+            tl.where(mask, tl.exp(target_block - tm_new), 0.0)
+        )
+        tm = tm_new
+
+    # Pass 3: compute loss with fused target softmax
     loss = 0.0
+    log_normalizer = tl.log(d)
     for i in range(0, n_cols, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_cols
         logits_block = tl.load(logits_ptr + offsets, mask=mask, other=0.0).cast(
             tl.float32
         )
-        target_block = tl.load(target_ptr + offsets, mask=mask, other=0.0).cast(
+        target_block = tl.load(target_ptr + offsets, mask=mask, other=float("-inf")).cast(
             tl.float32
         )
-        normalized_logits = logits_block - m
-        log_normalizer = tl.log(d)
-        log_softmax_logits = normalized_logits - log_normalizer
-        weighted_log_prob = target_block * log_softmax_logits
+        target_softmax = tl.exp(target_block - tm) / td
+        log_softmax_logits = (logits_block - m) - log_normalizer
+        weighted_log_prob = target_softmax * log_softmax_logits
         loss += tl.sum(tl.where(mask, weighted_log_prob, 0.0))
 
     loss_ptr += program_id * loss_stride
     m_ptr += program_id
     d_ptr += program_id
+    tm_ptr += program_id
+    td_ptr += program_id
     tl.store(loss_ptr, -loss)
     tl.store(m_ptr, m.to(tl.float32))
     tl.store(d_ptr, d.to(tl.float32))
+    tl.store(tm_ptr, tm.to(tl.float32))
+    tl.store(td_ptr, td.to(tl.float32))
 
 
 @triton.jit
@@ -108,6 +133,8 @@ def log_softmax_backward_kernel(
     scaling_factor,
     m_ptr,
     d_ptr,
+    tm_ptr,
+    td_ptr,
     n_cols,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -126,32 +153,40 @@ def log_softmax_backward_kernel(
 
     m_ptr += program_id
     d_ptr += program_id
+    tm_ptr += program_id
+    td_ptr += program_id
     m = tl.load(m_ptr).to(tl.float32)
     d = tl.load(d_ptr).to(tl.float32)
+    tm = tl.load(tm_ptr).to(tl.float32)
+    td = tl.load(td_ptr).to(tl.float32)
     grad_output = tl.load(grad_output_ptr).to(tl.float32)
     grad_output = grad_output * scaling_factor
 
+    # Pass 1: compute sum(target_softmax * grad_output)
     target_grad_sum = 0.0
     for i in range(0, n_cols, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_cols
-        target_block = tl.load(target_ptr + offsets, mask=mask, other=0.0).cast(
+        target_block = tl.load(target_ptr + offsets, mask=mask, other=float("-inf")).cast(
             tl.float32
         )
-        target_grad_sum += tl.sum(tl.where(mask, target_block * grad_output, 0.0))
+        target_softmax = tl.exp(target_block - tm) / td
+        target_grad_sum += tl.sum(tl.where(mask, target_softmax * grad_output, 0.0))
 
+    # Pass 2: compute gradients
     for i in range(0, n_cols, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_cols
         logits_block = tl.load(logits_ptr + offsets, mask=mask, other=0.0).cast(
             tl.float32
         )
-        target_block = tl.load(target_ptr + offsets, mask=mask, other=0.0).cast(
+        target_block = tl.load(target_ptr + offsets, mask=mask, other=float("-inf")).cast(
             tl.float32
         )
+        target_softmax = tl.exp(target_block - tm) / td
         softmax_prob = tl.exp(logits_block - m) / d
         normalized_grad = softmax_prob * target_grad_sum
-        grad_block = -(target_block * grad_output - normalized_grad)
+        grad_block = -(target_softmax * grad_output - normalized_grad)
         tl.store(logits_ptr + offsets, grad_block.to(tl.float32), mask=mask)
 
 
@@ -159,13 +194,16 @@ class LogSoftmaxLoss(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, target, position_mask):
         B, T, V = logits.shape
-        loss = torch.zeros((B * T, 1), device=logits.device)
-        logits_flat = logits.contiguous().view(B * T, V)
-        target_flat = target.contiguous().view(B * T, V)
-        position_mask_flat = position_mask.contiguous().view(B * T, 1).bool()
-        grid = (B * T,)
-        m = torch.zeros((B * T,), device=logits.device, dtype=torch.float32)
-        d = torch.zeros((B * T,), device=logits.device, dtype=torch.float32)
+        BT = B * T
+        loss = torch.zeros((BT, 1), device=logits.device)
+        logits_flat = logits.contiguous().view(BT, V)
+        target_flat = target.contiguous().view(BT, V)
+        position_mask_flat = position_mask.contiguous().view(BT, 1).bool()
+        grid = (BT,)
+        m = torch.zeros((BT,), device=logits.device, dtype=torch.float32)
+        d = torch.zeros((BT,), device=logits.device, dtype=torch.float32)
+        tm = torch.zeros((BT,), device=logits.device, dtype=torch.float32)
+        td = torch.zeros((BT,), device=logits.device, dtype=torch.float32)
         BLOCK_SIZE, num_warps = _calculate_settings(V)
         log_softmax_forward_kernel[grid](
             logits_flat,
@@ -178,18 +216,21 @@ class LogSoftmaxLoss(torch.autograd.Function):
             loss.stride(0),
             m,
             d,
+            tm,
+            td,
             V,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
         )
-        ctx.save_for_backward(logits.detach(), target, position_mask, m, d)
-        return loss.squeeze(1).mean()
+        n_valid = position_mask_flat.sum().float().clamp(min=1)
+        ctx.save_for_backward(logits.detach(), target, position_mask, m, d, tm, td, n_valid)
+        return loss.sum() / n_valid
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits, target, position_mask, m, d = ctx.saved_tensors
+        logits, target, position_mask, m, d, tm, td, n_valid = ctx.saved_tensors
         B, T, V = logits.shape
-        scaling_factor = 1.0 / (B * T)
+        scaling_factor = 1.0 / n_valid.item()
         logits = logits.contiguous().view(B * T, V)
         target = target.contiguous().view(B * T, V)
         position_mask = position_mask.contiguous().view(B * T, 1).bool()
@@ -205,6 +246,8 @@ class LogSoftmaxLoss(torch.autograd.Function):
             scaling_factor,
             m,
             d,
+            tm,
+            td,
             V,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
