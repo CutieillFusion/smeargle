@@ -28,7 +28,7 @@ import torch.nn.functional as F
 import os
 from transformers.activations import ACT2FN
 from transformers import AutoTokenizer
-from modeling_llama import LlamaForCausalLM
+from transformers import LlamaForCausalLM
 from configs import SmeargleConfig
 from triton_loss import LogSoftmaxLoss
 from safetensors import safe_open
@@ -208,6 +208,22 @@ class Model(nn.Module):
         self._target_model.eval()
         for param in self._target_model.parameters():
             param.requires_grad = False
+
+        num_layers = self._target_model.config.num_hidden_layers
+        self._aux_layer_indices = [1, num_layers // 2 - 1, num_layers - 4]
+        self._captured_hidden_states = {}
+
+        def _make_hook(layer_idx):
+            def hook(module, input, output):
+                if isinstance(output, tuple):
+                    self._captured_hidden_states[layer_idx] = output[0]
+                else:
+                    self._captured_hidden_states[layer_idx] = output
+            return hook
+
+        for idx in self._aux_layer_indices:
+            self._target_model.model.layers[idx].register_forward_hook(_make_hook(idx))
+
         self._target_model = torch.compile(self._target_model, mode="max-autotune-no-cudagraphs")
 
         self.fc = nn.Linear(self.hidden_size * 3, self.hidden_size, bias=False)
@@ -405,10 +421,12 @@ class Model(nn.Module):
             target_model = target_model.to(device)
             self._target_model = target_model
 
-        outs = target_model(input_ids=input_ids, attention_mask=attention_mask)
-
-        assert len(outs.hidden_states) == 3, "target model hidden states length is not 3"
-        hidden_states = torch.cat(outs.hidden_states, dim=-1)
+        self._captured_hidden_states.clear()
+        outs = target_model(input_ids=input_ids, attention_mask=attention_mask,
+                            output_hidden_states=False, use_cache=False)
+        hidden_states = torch.cat(
+            [self._captured_hidden_states[i] for i in self._aux_layer_indices], dim=-1
+        )
         target = outs.logits
         target = padding(target, left=False)
         input_ids = padding(input_ids, left=False)

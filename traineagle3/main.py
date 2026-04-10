@@ -370,7 +370,7 @@ for epoch in range(start_epoch, num_epochs):
             best_epoch = epoch
             patience_counter = 0
             print_rank(f"New best test pLoss: {best_test_ploss:.4f} at epoch {epoch + 1}")
-            model_engine.save_16bit_model(f"{savedir}/best_model", exclude_frozen_parameters=True)
+            # model_engine.save_16bit_model(f"{savedir}/best_model", exclude_frozen_parameters=True)
         else:
             print_rank(f"No improvement in test pLoss. Patience: {patience_counter}/{args.patience}")
 
@@ -382,10 +382,10 @@ for epoch in range(start_epoch, num_epochs):
     # clear out the redundance cache after each step
     torch.cuda.empty_cache()
     
-    model_engine.save_checkpoint(f"{savedir}/state_{epoch}")
-    model_engine.save_16bit_model(
-        f"{savedir}/state_{epoch}", exclude_frozen_parameters=True
-    )
+    # model_engine.save_checkpoint(f"{savedir}/state_{epoch}")
+    # model_engine.save_16bit_model(
+    #     f"{savedir}/state_{epoch}", exclude_frozen_parameters=True
+    # )
 
 # Explicit cleanup to prevent leaking resources
 deepspeed.comm.barrier()
