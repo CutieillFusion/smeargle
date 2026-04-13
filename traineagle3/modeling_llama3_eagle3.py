@@ -473,19 +473,26 @@ class Eagle3(nn.Module):
         config: EagleConfig,
         training_config: dict,
         path: str = None,
+        device_mesh=None,
     ):
         super().__init__()
         self.train_config = training_config
         self.draft_config = config
         self.gradient_checkpointing = self.train_config["gradient_checkpoint"]
         self.length = 7
+        self.device_mesh = device_mesh
 
-        # Load target model first so we can use its config for building layers
+        # Load target model with TP if device_mesh is provided
+        tp_kwargs = {}
+        if device_mesh is not None:
+            tp_kwargs = {"tp_plan": "auto", "device_mesh": device_mesh}
+
         self._target_model = LlamaForCausalLM.from_pretrained(
             path,
             dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             attn_implementation="sdpa",
+            **tp_kwargs,
         )
         self._target_model.config.use_cache = False
         self._target_model.eval()
@@ -518,11 +525,11 @@ class Eagle3(nn.Module):
         self.vocab_size = target_cfg.vocab_size
         self.draft_vocab_size = config.draft_vocab_size
 
-        self.midlayer = EagleDecoderLayeremb(target_cfg, config)
+        self.midlayer = EagleDecoderLayeremb(target_cfg, config).to(torch.bfloat16)
         self.rotary_emb = LlamaRotaryEmbedding(target_cfg)
-        self.norm = LlamaRMSNorm(hidden_size, eps=target_cfg.rms_norm_eps)
-        self.fc = nn.Linear(hidden_size * 3, hidden_size, bias=False)
-        self.lm_head = nn.Linear(hidden_size, config.draft_vocab_size, bias=False)
+        self.norm = LlamaRMSNorm(hidden_size, eps=target_cfg.rms_norm_eps).to(torch.bfloat16)
+        self.fc = nn.Linear(hidden_size * 3, hidden_size, bias=False, dtype=torch.bfloat16)
+        self.lm_head = nn.Linear(hidden_size, config.draft_vocab_size, bias=False, dtype=torch.bfloat16)
         self.register_buffer(
             "ploss_weights",
             torch.tensor([0.8**i for i in range(self.length)]),
@@ -539,14 +546,14 @@ class Eagle3(nn.Module):
             ) as f:
                 tensor_slice = f.get_slice("model.embed_tokens.weight")
                 vocab_size, hidden_dim = tensor_slice.get_shape()
-                tensor = tensor_slice[:, :hidden_dim].float()
+                tensor = tensor_slice[:, :hidden_dim].to(torch.bfloat16)
         except:
             with open(os.path.join(path, "pytorch_model.bin.index.json"), "r") as f:
                 index_json = json.loads(f.read())
                 emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
 
             weights = torch.load(os.path.join(path, emb_path))
-            tensor = weights["model.embed_tokens.weight"].float()
+            tensor = weights["model.embed_tokens.weight"].to(torch.bfloat16)
 
         assert tensor is not None, "Embedding tensor is None"
         self.embed_tokens = nn.Embedding(
@@ -561,18 +568,18 @@ class Eagle3(nn.Module):
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
 
-    def scandata(self, datapath: str, tokenizerpath: str, local_rank: int):
+    def scandata(self, datapath: str, tokenizerpath: str, global_rank: int):
         if os.path.exists("cache.pt"):
             cache = torch.load("cache.pt")
             d2t = cache["d2t"]
             t2d = cache["t2d"]
-        elif local_rank != 0:
+        elif global_rank != 0:
             while not os.path.exists("cache.pt"):
                 time.sleep(1)
             cache = torch.load("cache.pt")
             d2t = cache["d2t"]
             t2d = cache["t2d"]
-        elif local_rank == 0:
+        elif global_rank == 0:
             tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
             dataset = load_dataset("json", data_files=datapath)
             dataset = dataset["train"]
@@ -718,21 +725,15 @@ class Eagle3(nn.Module):
         return combined_attention_mask
 
     @torch.no_grad()
-    def dataprepare(
+    def target_forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
     ):
-        device = input_ids.device
-        target_model = self._target_model
-        model_device = next(target_model.parameters()).device
-        if model_device != device:
-            target_model = target_model.to(device)
-            self._target_model = target_model
-
+        """Run the frozen target model. ALL TP ranks must call this."""
         self._captured_hidden_states.clear()
-        outs = target_model(
+        outs = self._target_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=False,
@@ -749,19 +750,14 @@ class Eagle3(nn.Module):
 
         return hidden_states, target, loss_mask, input_ids
 
-    def forward(
+    def draft_forward(
         self,
+        hidden_states: torch.Tensor,
+        target: torch.Tensor,
+        loss_mask: torch.Tensor,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        loss_mask: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
     ):
-        hidden_states, target, loss_mask, input_ids = self.dataprepare(
-            input_ids, attention_mask, loss_mask
-        )
-
+        """Run the trainable draft model. Only draft rank calls this."""
         batch_size, seq_length, _ = hidden_states.shape
 
         if (
@@ -774,19 +770,15 @@ class Eagle3(nn.Module):
         hidden_states = hidden_states.to(self.fc.weight.dtype)
         hidden_states = self.fc(hidden_states)
 
-        if self.gradient_checkpointing and self.training and use_cache:
-            use_cache = False
-
-        if position_ids is None:
-            position_ids = (
-                torch.arange(
-                    seq_length,
-                    device=hidden_states.device,
-                    dtype=torch.long,
-                )
-                .unsqueeze(0)
-                .expand(batch_size, -1)
+        position_ids = (
+            torch.arange(
+                seq_length,
+                device=hidden_states.device,
+                dtype=torch.long,
             )
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+        )
 
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
@@ -824,7 +816,7 @@ class Eagle3(nn.Module):
                 attention_mask=None,
                 position_ids=position_ids,
                 past_key_values=None,
-                use_cache=use_cache,
+                use_cache=False,
                 position_embeddings=position_embeddings,
             )
 
@@ -862,9 +854,8 @@ def print_model_summary(model: nn.Module):
 
 if __name__ == "__main__":
     config = EagleConfig.from_json("config.json")
-    ds_config = json.load(open("ds_config.json"))
     training_config = {
-        "bs": ds_config["train_micro_batch_size_per_gpu"],
+        "bs": 1,
         "num_epochs": 1,
         "num_workers": 2,
         "max_len": 2048,

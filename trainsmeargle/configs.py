@@ -12,8 +12,6 @@ class SmeargleConfig:
     def __init__(
         self,
         draft_vocab_size=32000,
-        num_heads=128,
-        head_dim=64,
         state_size=256,
         expand=2,
         conv_kernel=4,
@@ -22,8 +20,6 @@ class SmeargleConfig:
         **kwargs,
     ):
         self.draft_vocab_size = draft_vocab_size
-        self.num_heads = num_heads
-        self.head_dim = head_dim
         self.state_size = state_size
         self.expand = expand
         self.conv_kernel = conv_kernel

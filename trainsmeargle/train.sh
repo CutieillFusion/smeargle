@@ -12,6 +12,8 @@
 cd /data/ai_club/smeargle/trainsmeargle
 
 SAVEDIR=${1:-$SLURM_JOB_ID}
+NUM_GPUS=${2:-$SLURM_GPUS_ON_NODE}
+TP_SIZE=${3:-$NUM_GPUS}
 
 # Mount your project and use host's uv
 singularity exec --nv \
@@ -27,11 +29,11 @@ singularity exec --nv \
     export PATH=\$CUDA_HOME/bin:\$PATH && \
     export LD_LIBRARY_PATH=\$CUDA_HOME/lib64:\$LD_LIBRARY_PATH && \
     uv sync && \
-    .venv/bin/python .venv/bin/deepspeed --master_port 29000 main.py \
-      --deepspeed_config ds_config.json \
+    .venv/bin/torchrun --nproc_per_node=$NUM_GPUS --master_port=29000 main.py \
+      --tp_size $TP_SIZE \
       --basepath /models/llama_3_1_8b_instruct \
-      --trainpath /datasets/train_5k.jsonl \
-      --testpath /datasets/test_5k.jsonl \
-      --epochs 1 \
+      --trainpath /datasets/perfect_blend/train_regen.jsonl \
+      --testpath /datasets/perfect_blend/test_regen.jsonl \
+      --epochs 10 \
       --savedir $SAVEDIR
   "

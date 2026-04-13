@@ -1,10 +1,9 @@
 import argparse
-import deepspeed
-import json
-import re
 import os
 import torch
-from modeling_llama3_eagle3 import Eagle3
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from modeling_llama3_smeargle import Smeargle
 from configs import SmeargleConfig
 from datasets import load_dataset
 from typing import Any, Dict, List
@@ -13,18 +12,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer
-from deepspeed.runtime.fp16.loss_scaler import DynamicLossScaler, LossScaler
-from deepspeed.runtime.zero.config import ZeroStageEnum
-from deepspeed.utils.tensor_fragment import fragment_address
 from accelerate.utils import set_seed
 
 set_seed(0)
 # This makes the model run faster on Ampere GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
-# Add safe globals to prevent issues with checkpoint loading
-torch.serialization.add_safe_globals(
-    [DynamicLossScaler, ZeroStageEnum, fragment_address, LossScaler]
-)
 
 parser = argparse.ArgumentParser(description="sp")
 parser.add_argument("--basepath", type=str, required=True)
@@ -32,10 +24,10 @@ parser.add_argument("--trainpath", type=str, required=True)
 parser.add_argument("--testpath", type=str, required=True)
 parser.add_argument("--savedir", type=str, required=True)
 parser.add_argument(
-    "--local_rank",
+    "--tp_size",
     type=int,
-    default=-1,
-    help="local_rank for distributed training on gpus",
+    default=4,
+    help="Tensor parallelism degree for the target model",
 )
 parser.add_argument(
     "--patience",
@@ -49,15 +41,15 @@ parser.add_argument(
     default=40,
     help="Number of epochs to train",
 )
-parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
-deepspeed_config = args.deepspeed_config
-with open(deepspeed_config) as f:
-    ds_config = json.load(f)
+# Training hyperparameters
+BATCH_SIZE = 1
+GRAD_ACCUM = 2
+GRAD_CLIP = 0.5
 
 train_config = {
-    "bs": ds_config["train_micro_batch_size_per_gpu"],
+    "bs": BATCH_SIZE,
     "num_epochs": args.epochs,
     "num_workers": 2,
     "max_len": 2048,
@@ -85,6 +77,7 @@ def compute_assistant_loss_mask(input_ids_list, assistant_header_ids, eot_ids):
 
     for hs in header_starts:
         response_start = hs + header_len
+        # Find next eot_id after the response start
         eot_starts = find_subsequence(seq[response_start:], eot_ids)
         if eot_starts:
             response_end = response_start + eot_starts[0]
@@ -204,46 +197,66 @@ class DataCollatorWithPadding:
         return batch
 
 
+# --- Distributed initialization ---
+dist.init_process_group(backend="nccl")
+local_rank = int(os.environ["LOCAL_RANK"])
+global_rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+torch.cuda.set_device(local_rank)
+
+tp_size = args.tp_size
+assert world_size % tp_size == 0, (
+    f"world_size ({world_size}) must be divisible by tp_size ({tp_size})"
+)
+dp_size = world_size // tp_size
+
+mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+tp_rank = mesh["tp"].get_local_rank()
+dp_rank = mesh["dp"].get_local_rank()
+is_draft_rank = tp_rank == 0
+dp_group = mesh["dp"].get_group() if dp_size > 1 else None
+
+device = torch.device(f"cuda:{local_rank}")
+
 tokenizer = AutoTokenizer.from_pretrained(args.basepath)
 traindataset = build_dataset_rank(tokenizer, args.trainpath)
 testdataset = build_dataset_rank(tokenizer, args.testpath)
 
 config = SmeargleConfig.from_json(train_config["config_path"])
-model = Eagle3(config, train_config, path=args.basepath)
-model.scandata(args.trainpath, args.basepath, args.local_rank)
+model = Smeargle(config, train_config, path=args.basepath, device_mesh=mesh)
+model.scandata(args.trainpath, args.basepath, global_rank)
 
-# Load target model before DeepSpeed init so all params are registered (fixes save_checkpoint)
-_ = model._target_model
+# Move draft components to the local device (target model is already placed by TP)
+for name, param in model.named_parameters():
+    if not name.startswith("_target_model") and param.device.type == "cpu":
+        param.data = param.data.to(device)
+for name, buf in model.named_buffers():
+    if not name.startswith("_target_model") and buf.device.type == "cpu":
+        buf.data = buf.data.to(device)
 
 num_epochs = train_config["num_epochs"]
 
-# Create PyTorch AdamW optimizer manually to bypass DeepSpeed's FusedAdam (which fails on compute_90)
-opt_params = ds_config["optimizer"]["params"]
+# Optimizer and scheduler -- draft rank only
 max_lr = 5e-5
-raw_optimizer = optim.AdamW(
-    model.parameters(),
-    lr=max_lr,
-    betas=tuple(opt_params["betas"]),
-    weight_decay=opt_params["weight_decay"],
-    eps=1e-8,
-)
-
-model_engine, optimizer, _, _ = deepspeed.initialize(
-    args=args,
-    model=model,
-    optimizer=raw_optimizer,
-    model_parameters=model.parameters(),
-)
-
-global_rank = deepspeed.comm.get_rank()
-world_size = deepspeed.comm.get_world_size()
+if is_draft_rank:
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(
+        trainable_params,
+        lr=max_lr,
+        betas=(0.9, 0.95),
+        weight_decay=0.0,
+        eps=1e-8,
+    )
+else:
+    trainable_params = None
+    optimizer = None
 
 savedir = f"models/{args.savedir}"
-
 os.makedirs(savedir, exist_ok=True)
 
+# DataLoader uses dp_rank so all TP ranks in a group get the same batch
 sampler = DistributedSampler(
-    testdataset, num_replicas=world_size, rank=global_rank, shuffle=False
+    testdataset, num_replicas=dp_size, rank=dp_rank, shuffle=False
 )
 test_loader = DataLoader(
     testdataset,
@@ -255,7 +268,7 @@ test_loader = DataLoader(
 )
 
 train_sampler = DistributedSampler(
-    traindataset, num_replicas=world_size, rank=global_rank, shuffle=True
+    traindataset, num_replicas=dp_size, rank=dp_rank, shuffle=True
 )
 train_loader = DataLoader(
     traindataset,
@@ -266,44 +279,22 @@ train_loader = DataLoader(
     collate_fn=DataCollatorWithPadding(),
 )
 
-# Cosine annealing with linear warmup (SpecForge/TorchSpec style)
-# Uses the raw optimizer reference (before DeepSpeed wrapping) for PyTorch schedulers
-grad_accum = ds_config.get("gradient_accumulation_steps", 1)
-steps_per_epoch = len(train_loader) // grad_accum
-total_steps = steps_per_epoch * num_epochs
-warmup_ratio = 0.015
-warmup_steps = max(1, int(total_steps * warmup_ratio))
+# LR scheduler (draft rank only)
+if is_draft_rank:
+    steps_per_epoch = len(train_loader) // GRAD_ACCUM
+    total_steps = steps_per_epoch * num_epochs
+    warmup_ratio = 0.015
+    warmup_steps = max(1, int(total_steps * warmup_ratio))
 
-warmup_scheduler = LinearLR(
-    raw_optimizer, start_factor=1e-6 / max_lr, total_iters=warmup_steps
-)
-cosine_scheduler = CosineAnnealingLR(
-    raw_optimizer, T_max=total_steps - warmup_steps, eta_min=1e-6
-)
-lr_scheduler = SequentialLR(
-    raw_optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps]
-)
-
-
-def find_max_state_with_file(directory, filename="zero_to_fp32.py"):
-    max_a = -1
-    for subdir in os.listdir(directory):
-        match = re.match(r"state_(\d+)", subdir)
-        if match:
-            a_value = int(match.group(1))
-            subdir_path = os.path.join(directory, subdir)
-            file_path = os.path.join(subdir_path, filename)
-            if os.path.isdir(subdir_path) and os.path.exists(file_path):
-                max_a = max(max_a, a_value)
-    if max_a == -1:
-        return None, 0
-    return f"{directory}/state_{max_a}", max_a + 1
-
-
-checkpoint_path, start_epoch = find_max_state_with_file(savedir)
-if checkpoint_path:
-    print(f"load from {checkpoint_path}")
-    model_engine.load_checkpoint(checkpoint_path)
+    warmup_scheduler = LinearLR(
+        optimizer, start_factor=1e-6 / max_lr, total_iters=warmup_steps
+    )
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer, T_max=total_steps - warmup_steps, eta_min=1e-6
+    )
+    lr_scheduler = SequentialLR(
+        optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps]
+    )
 
 
 def print_rank(message: str):
@@ -314,11 +305,12 @@ def print_rank(message: str):
 def reduce_and_print(
     epoch_metrics: list[list[float]], mode: str, metric_name: str, epoch: int
 ) -> list[float]:
+    """Reduce metrics across DP group (draft ranks only)."""
     reduced = []
     for i, metric in enumerate(epoch_metrics):
         metric = torch.tensor(metric).cuda().mean()
-        torch.cuda.empty_cache()
-        deepspeed.comm.all_reduce(metric, op=deepspeed.comm.ReduceOp.AVG)
+        if dp_group is not None:
+            dist.all_reduce(metric, op=dist.ReduceOp.AVG, group=dp_group)
         print_rank(
             f"{mode} Epoch [{epoch + 1}/{num_epochs}], position {i}, {metric_name}: {metric.item():.2f}"
         )
@@ -339,7 +331,7 @@ best_test_ploss = float("inf")
 patience_counter = 0
 best_epoch = -1
 
-for epoch in range(start_epoch, num_epochs):
+for epoch in range(num_epochs):
     train_sampler.set_epoch(epoch + 1)
     print_rank(f"Now training epoch {epoch}")
 
@@ -347,97 +339,139 @@ for epoch in range(start_epoch, num_epochs):
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
 
-    for data in tqdm(train_loader):
-        model.zero_grad()
+    if is_draft_rank:
+        optimizer.zero_grad()
 
-        device = next(model_engine.module.parameters()).device
+    grad_step = 0
+
+    for data in tqdm(train_loader, disable=(global_rank != 0)):
         input_ids = data["input_ids"].to(device)
         attention_mask = data["attention_mask"].to(device)
         loss_mask = data["loss_mask"].to(device)
 
-        plosses, acces = model_engine(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            loss_mask=loss_mask,
+        hidden_states, target, loss_mask_out, input_ids_out = model.target_forward(
+            input_ids, attention_mask, loss_mask
         )
 
-        ploss_stack = torch.stack(plosses)
-        loss = (model.ploss_weights.to(ploss_stack.device) * ploss_stack).sum()
+        if is_draft_rank:
+            plosses, acces = model.draft_forward(
+                hidden_states, target, loss_mask_out, input_ids_out
+            )
 
-        model_engine.backward(loss)
+            ploss_stack = torch.stack(plosses)
+            loss = (model.ploss_weights.to(device) * ploss_stack).sum()
 
-        model_engine.step()
-        if model_engine.is_gradient_accumulation_boundary():
-            lr_scheduler.step()
+            scaled_loss = loss / GRAD_ACCUM
+            scaled_loss.backward()
 
-        epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
-        epoch_plosses = [
-            epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
-        ]
+            grad_step += 1
+            if grad_step % GRAD_ACCUM == 0:
+                if dp_group is not None:
+                    for p in trainable_params:
+                        if p.grad is not None:
+                            dist.all_reduce(
+                                p.grad, op=dist.ReduceOp.AVG, group=dp_group
+                            )
 
-    train_acces = reduce_and_print(epoch_acces, "Train", "Acc", epoch)
-    reduce_and_print(epoch_plosses, "Train", "pLoss", epoch)
-    print_rank(
-        f"Train Epoch [{epoch + 1}/{num_epochs}], Simulated Acceptance Length: {simulated_acceptance_length(train_acces):.2f}"
-    )
+                torch.nn.utils.clip_grad_norm_(trainable_params, GRAD_CLIP)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+            for i in range(len(acces)):
+                epoch_acces[i].append(acces[i])
+                epoch_plosses[i].append(plosses[i].item())
+
+    if is_draft_rank:
+        train_acces = reduce_and_print(epoch_acces, "Train", "Acc", epoch)
+        reduce_and_print(epoch_plosses, "Train", "pLoss", epoch)
+        print_rank(
+            f"Train Epoch [{epoch + 1}/{num_epochs}], Simulated Acceptance Length: {simulated_acceptance_length(train_acces):.2f}"
+        )
 
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
 
     model.eval()
-    for data in tqdm(test_loader):
+    for data in tqdm(test_loader, disable=(global_rank != 0)):
         with torch.no_grad():
-            device = next(model_engine.module.parameters()).device
-            plosses, acces = model_engine(
-                input_ids=data["input_ids"].to(device),
-                attention_mask=data["attention_mask"].to(device),
-                loss_mask=data["loss_mask"].to(device),
-            )
-            epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
-            epoch_plosses = [
-                epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
-            ]
+            input_ids = data["input_ids"].to(device)
+            attention_mask = data["attention_mask"].to(device)
+            loss_mask = data["loss_mask"].to(device)
 
-    test_acces = reduce_and_print(epoch_acces, "Test", "Acc", epoch)
-    test_plosses = reduce_and_print(epoch_plosses, "Test", "pLoss", epoch)
-    test_ploss = sum(test_plosses) / len(test_plosses)
-    test_acc_length = simulated_acceptance_length(test_acces)
-    print_rank(
-        f"Test Epoch [{epoch + 1}/{num_epochs}], Simulated Acceptance Length: {test_acc_length:.2f}"
-    )
-
-    # Early stopping based on test pLoss on average test position loss
-    if args.patience is not None:
-        if test_ploss < best_test_ploss:
-            best_test_ploss = test_ploss
-            best_epoch = epoch
-            patience_counter = 0
-            print_rank(
-                f"New best test pLoss: {best_test_ploss:.4f} at epoch {epoch + 1}"
-            )
-            # model_engine.save_16bit_model(
-            #     f"{savedir}/best_model", exclude_frozen_parameters=True
-            # )
-        else:
-            print_rank(
-                f"No improvement in test pLoss. Patience: {patience_counter}/{args.patience}"
+            hidden_states, target, loss_mask_out, input_ids_out = model.target_forward(
+                input_ids, attention_mask, loss_mask
             )
 
-            if patience_counter >= args.patience:
-                print_rank(
-                    f"Early stopping triggered! Best test pLoss: {best_test_ploss:.4f} at epoch {best_epoch + 1}"
+            if is_draft_rank:
+                plosses, acces = model.draft_forward(
+                    hidden_states, target, loss_mask_out, input_ids_out
                 )
-                break
-            patience_counter += 1
+                for i in range(len(acces)):
+                    epoch_acces[i].append(acces[i])
+                    epoch_plosses[i].append(plosses[i].item())
 
-    # clear out the redundance cache after each step
+    should_stop = torch.zeros(1, dtype=torch.long, device=device)
+    if is_draft_rank:
+        test_acces = reduce_and_print(epoch_acces, "Test", "Acc", epoch)
+        test_plosses = reduce_and_print(epoch_plosses, "Test", "pLoss", epoch)
+        test_ploss = sum(test_plosses) / len(test_plosses)
+        test_acc_length = simulated_acceptance_length(test_acces)
+        print_rank(
+            f"Test Epoch [{epoch + 1}/{num_epochs}], Simulated Acceptance Length: {test_acc_length:.2f}"
+        )
+
+        if args.patience is not None:
+            if test_ploss < best_test_ploss:
+                best_test_ploss = test_ploss
+                best_epoch = epoch
+                patience_counter = 0
+                print_rank(
+                    f"New best test pLoss: {best_test_ploss:.4f} at epoch {epoch + 1}"
+                )
+            else:
+                print_rank(
+                    f"No improvement in test pLoss. Patience: {patience_counter}/{args.patience}"
+                )
+
+                if patience_counter >= args.patience:
+                    print_rank(
+                        f"Early stopping triggered! Best test pLoss: {best_test_ploss:.4f} at epoch {best_epoch + 1}"
+                    )
+                    should_stop.fill_(1)
+                patience_counter += 1
+
+    if global_rank == 0:
+        trainable_state = {
+            k: v for k, v in model.state_dict().items()
+            if not k.startswith("_target_model")
+        }
+
+        if best_epoch == epoch:
+            os.makedirs(f"{savedir}/best_model", exist_ok=True)
+            torch.save(trainable_state, f"{savedir}/best_model/draft_model.pt")
+            print_rank(f"Saved best model to {savedir}/best_model/")
+
+        checkpoint_dir = f"{savedir}/state_{epoch}"
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        torch.save(trainable_state, f"{checkpoint_dir}/draft_model.pt")
+        torch.save(
+            {
+                "epoch": epoch,
+                "optimizer": optimizer.state_dict(),
+                "lr_scheduler": lr_scheduler.state_dict(),
+            },
+            f"{checkpoint_dir}/training_state.pt",
+        )
+        print_rank(f"Saved checkpoint to {checkpoint_dir}/")
+
+    # Broadcast stop decision to all ranks so non-draft ranks exit too
+    dist.broadcast(should_stop, src=0)
+    if should_stop.item():
+        break
+
     torch.cuda.empty_cache()
 
-    # model_engine.save_checkpoint(f"{savedir}/state_{epoch}")
-    # model_engine.save_16bit_model(
-    #     f"{savedir}/state_{epoch}", exclude_frozen_parameters=True
-    # )
-
-# Explicit cleanup to prevent leaking resources
-deepspeed.comm.barrier()
-deepspeed.comm.destroy_process_group()
+# Explicit cleanup
+dist.barrier()
+dist.destroy_process_group()
