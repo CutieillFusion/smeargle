@@ -22,7 +22,9 @@ set_seed(0)
 # This makes the model run faster on Ampere GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 # Add safe globals to prevent issues with checkpoint loading
-torch.serialization.add_safe_globals([DynamicLossScaler, ZeroStageEnum, fragment_address, LossScaler])
+torch.serialization.add_safe_globals(
+    [DynamicLossScaler, ZeroStageEnum, fragment_address, LossScaler]
+)
 
 parser = argparse.ArgumentParser(description="sp")
 parser.add_argument("--basepath", type=str, required=True)
@@ -63,12 +65,13 @@ train_config = {
     "gradient_checkpoint": True,
 }
 
+
 def find_subsequence(seq, pattern):
     """Find all start indices of pattern in seq."""
     indices = []
     plen = len(pattern)
     for i in range(len(seq) - plen + 1):
-        if seq[i:i + plen] == pattern:
+        if seq[i : i + plen] == pattern:
             indices.append(i)
     return indices
 
@@ -95,7 +98,6 @@ def compute_assistant_loss_mask(input_ids_list, assistant_header_ids, eot_ids):
 
 
 def build_dataset_rank(tokenizer, datapath):
-
     ds = load_dataset("json", data_files=datapath)
     ds = ds["train"]
     ds = ds.shuffle(seed=42)
@@ -174,7 +176,6 @@ def build_dataset_rank(tokenizer, datapath):
 
 
 class DataCollatorWithPadding:
-
     def paddingtensor2D(self, intensors, N):
         B, n = intensors.shape
         padding_tensor = torch.zeros(B, N - n, dtype=intensors.dtype)
@@ -208,10 +209,8 @@ tokenizer = AutoTokenizer.from_pretrained(args.basepath)
 traindataset = build_dataset_rank(tokenizer, args.trainpath)
 testdataset = build_dataset_rank(tokenizer, args.testpath)
 
-config = EagleConfig.from_pretrained(train_config["config_path"])
-model = Eagle3(
-    config, train_config, path=args.basepath
-)
+config = EagleConfig.from_json(train_config["config_path"])
+model = Eagle3(config, train_config, path=args.basepath)
 model.scandata(args.trainpath, args.basepath, args.local_rank)
 
 # Load target model before DeepSpeed init so all params are registered (fixes save_checkpoint)
@@ -276,9 +275,15 @@ total_steps = steps_per_epoch * num_epochs
 warmup_ratio = 0.015
 warmup_steps = max(1, int(total_steps * warmup_ratio))
 
-warmup_scheduler = LinearLR(raw_optimizer, start_factor=1e-6 / max_lr, total_iters=warmup_steps)
-cosine_scheduler = CosineAnnealingLR(raw_optimizer, T_max=total_steps - warmup_steps, eta_min=1e-6)
-lr_scheduler = SequentialLR(raw_optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+warmup_scheduler = LinearLR(
+    raw_optimizer, start_factor=1e-6 / max_lr, total_iters=warmup_steps
+)
+cosine_scheduler = CosineAnnealingLR(
+    raw_optimizer, T_max=total_steps - warmup_steps, eta_min=1e-6
+)
+lr_scheduler = SequentialLR(
+    raw_optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps]
+)
 
 
 def find_max_state_with_file(directory, filename="zero_to_fp32.py"):
@@ -306,15 +311,21 @@ def print_rank(message: str):
     if global_rank == 0:
         print(message)
 
-def reduce_and_print(epoch_metrics: list[list[float]], mode: str, metric_name: str, epoch: int) -> list[float]:
+
+def reduce_and_print(
+    epoch_metrics: list[list[float]], mode: str, metric_name: str, epoch: int
+) -> list[float]:
     reduced = []
     for i, metric in enumerate(epoch_metrics):
         metric = torch.tensor(metric).cuda().mean()
         torch.cuda.empty_cache()
         deepspeed.comm.all_reduce(metric, op=deepspeed.comm.ReduceOp.AVG)
-        print_rank(f"{mode} Epoch [{epoch + 1}/{num_epochs}], position {i}, {metric_name}: {metric.item():.2f}")
+        print_rank(
+            f"{mode} Epoch [{epoch + 1}/{num_epochs}], position {i}, {metric_name}: {metric.item():.2f}"
+        )
         reduced.append(metric.item())
     return reduced
+
 
 def simulated_acceptance_length(acces: list[float]) -> float:
     cumulative = 1.0
@@ -323,6 +334,7 @@ def simulated_acceptance_length(acces: list[float]) -> float:
         cumulative *= a
         acc_length += cumulative
     return acc_length
+
 
 best_test_ploss = float("inf")
 patience_counter = 0
@@ -366,7 +378,9 @@ for epoch in range(start_epoch, num_epochs):
 
     train_acces = reduce_and_print(epoch_acces, "Train", "Acc", epoch)
     reduce_and_print(epoch_plosses, "Train", "pLoss", epoch)
-    print_rank(f"Train Epoch [{epoch + 1}/{num_epochs}], Simulated Acceptance Length: {simulated_acceptance_length(train_acces):.2f}")
+    print_rank(
+        f"Train Epoch [{epoch + 1}/{num_epochs}], Simulated Acceptance Length: {simulated_acceptance_length(train_acces):.2f}"
+    )
 
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
@@ -389,7 +403,9 @@ for epoch in range(start_epoch, num_epochs):
     test_plosses = reduce_and_print(epoch_plosses, "Test", "pLoss", epoch)
     test_ploss = sum(test_plosses) / len(test_plosses)
     test_acc_length = simulated_acceptance_length(test_acces)
-    print_rank(f"Test Epoch [{epoch + 1}/{num_epochs}], Simulated Acceptance Length: {test_acc_length:.2f}")
+    print_rank(
+        f"Test Epoch [{epoch + 1}/{num_epochs}], Simulated Acceptance Length: {test_acc_length:.2f}"
+    )
 
     # Early stopping based on test pLoss on average test position loss
     if args.patience is not None:
@@ -397,19 +413,27 @@ for epoch in range(start_epoch, num_epochs):
             best_test_ploss = test_ploss
             best_epoch = epoch
             patience_counter = 0
-            print_rank(f"New best test pLoss: {best_test_ploss:.4f} at epoch {epoch + 1}")
-            model_engine.save_16bit_model(f"{savedir}/best_model", exclude_frozen_parameters=True)
+            print_rank(
+                f"New best test pLoss: {best_test_ploss:.4f} at epoch {epoch + 1}"
+            )
+            # model_engine.save_16bit_model(
+            #     f"{savedir}/best_model", exclude_frozen_parameters=True
+            # )
         else:
-            print_rank(f"No improvement in test pLoss. Patience: {patience_counter}/{args.patience}")
+            print_rank(
+                f"No improvement in test pLoss. Patience: {patience_counter}/{args.patience}"
+            )
 
             if patience_counter >= args.patience:
-                print_rank(f"Early stopping triggered! Best test pLoss: {best_test_ploss:.4f} at epoch {best_epoch + 1}")
+                print_rank(
+                    f"Early stopping triggered! Best test pLoss: {best_test_ploss:.4f} at epoch {best_epoch + 1}"
+                )
                 break
             patience_counter += 1
 
     # clear out the redundance cache after each step
     torch.cuda.empty_cache()
-    
+
     # model_engine.save_checkpoint(f"{savedir}/state_{epoch}")
     # model_engine.save_16bit_model(
     #     f"{savedir}/state_{epoch}", exclude_frozen_parameters=True

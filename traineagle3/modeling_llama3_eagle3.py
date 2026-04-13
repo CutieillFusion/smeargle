@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch LLaMA model."""
+
 import time
 import json
 from typing import Callable, List, Optional, Tuple
@@ -120,7 +121,9 @@ class LlamaRotaryEmbedding(nn.Module):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+            self.rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type")
+            )
         else:
             self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
@@ -136,12 +139,23 @@ class LlamaRotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None]
+            .float()
+            .expand(position_ids.shape[0], -1, 1)
+            .to(x.device)
+        )
         position_ids_expanded = position_ids[:, None, :].float()
 
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
@@ -189,9 +203,15 @@ class LlamaMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.gate_proj = nn.Linear(
+            self.hidden_size, self.intermediate_size
+        )
+        self.up_proj = nn.Linear(
+            self.hidden_size, self.intermediate_size
+        )
+        self.down_proj = nn.Linear(
+            self.intermediate_size, self.hidden_size
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
@@ -207,7 +227,9 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
@@ -229,8 +251,12 @@ def eager_attention_forward(
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        query.dtype
+    )
+    attn_weights = nn.functional.dropout(
+        attn_weights, p=dropout, training=module.training
+    )
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
@@ -240,27 +266,39 @@ def eager_attention_forward(
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: EagleConfig, layer_idx: int):
+    def __init__(self, config, layer_idx: int, attention_dropout: float = 0.0):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.num_key_value_groups = (
+            config.num_attention_heads // config.num_key_value_heads
+        )
         self.scaling = self.head_dim**-0.5
-        self.attention_dropout = config.attention_dropout
+        self.attention_dropout = attention_dropout
         self.is_causal = True
 
         self.q_proj = nn.Linear(
-            config.hidden_size * 2, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size * 2,
+            config.num_attention_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.k_proj = nn.Linear(
-            config.hidden_size * 2, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size * 2,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.v_proj = nn.Linear(
-            config.hidden_size * 2, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size * 2,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
         )
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -281,18 +319,24 @@ class LlamaAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin
+        )
 
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_output = F.scaled_dot_product_attention(
-            query_states, key_states, value_states,
+            query_states,
+            key_states,
+            value_states,
             attn_mask=None,
             dropout_p=0.0 if not self.training else self.attention_dropout,
             is_causal=True,
@@ -307,16 +351,21 @@ class LlamaAttention(nn.Module):
 
 
 class EagleDecoderLayeremb(GradientCheckpointingLayer):
-    def __init__(self, config: EagleConfig):
+    def __init__(self, target_config, draft_config):
         super().__init__()
-        self.hidden_size = config.hidden_size
+        self.hidden_size = target_config.hidden_size
 
-        self.self_attn = LlamaAttention(config=config, layer_idx=0)
+        self.self_attn = LlamaAttention(
+            config=target_config, layer_idx=0,
+            attention_dropout=draft_config.attention_dropout,
+        )
 
-        self.mlp = LlamaMLP(config)
-        self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = LlamaMLP(target_config)
+        self.hidden_norm = LlamaRMSNorm(target_config.hidden_size, eps=target_config.rms_norm_eps)
+        self.input_layernorm = LlamaRMSNorm(target_config.hidden_size, eps=target_config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(
+            target_config.hidden_size, eps=target_config.rms_norm_eps
+        )
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -328,7 +377,9 @@ class EagleDecoderLayeremb(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        position_embeddings: Optional[
+            tuple[torch.Tensor, torch.Tensor]
+        ] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -394,7 +445,7 @@ def _find_subsequence(seq, pattern):
     indices = []
     plen = len(pattern)
     for i in range(len(seq) - plen + 1):
-        if seq[i:i + plen] == pattern:
+        if seq[i : i + plen] == pattern:
             indices.append(i)
     return indices
 
@@ -425,28 +476,24 @@ class Eagle3(nn.Module):
     ):
         super().__init__()
         self.train_config = training_config
-        self.config = config
-        self.midlayer = EagleDecoderLayeremb(config)
-        self.rotary_emb = LlamaRotaryEmbedding(self.config)
+        self.draft_config = config
         self.gradient_checkpointing = self.train_config["gradient_checkpoint"]
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-        self.hidden_size = config.hidden_size
-        self.draft_vocab_size = config.draft_vocab_size
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.length = 7
-        self.register_buffer("ploss_weights", torch.tensor([0.8**i for i in range(self.length)]), persistent=False)
 
+        # Load target model first so we can use its config for building layers
         self._target_model = LlamaForCausalLM.from_pretrained(
-            path, dtype=torch.bfloat16, low_cpu_mem_usage=True,
-            attn_implementation="sdpa"
+            path,
+            dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            attn_implementation="sdpa",
         )
         self._target_model.config.use_cache = False
         self._target_model.eval()
         for param in self._target_model.parameters():
             param.requires_grad = False
 
-        num_layers = self._target_model.config.num_hidden_layers
+        target_cfg = self._target_model.config
+        num_layers = target_cfg.num_hidden_layers
         self._aux_layer_indices = [1, num_layers // 2 - 1, num_layers - 4]
         self._captured_hidden_states = {}
 
@@ -456,15 +503,32 @@ class Eagle3(nn.Module):
                     self._captured_hidden_states[layer_idx] = output[0]
                 else:
                     self._captured_hidden_states[layer_idx] = output
+
             return hook
 
         for idx in self._aux_layer_indices:
             self._target_model.model.layers[idx].register_forward_hook(_make_hook(idx))
 
-        self._target_model = torch.compile(self._target_model, mode="max-autotune-no-cudagraphs")
+        self._target_model = torch.compile(
+            self._target_model, mode="max-autotune-no-cudagraphs"
+        )
 
-        self.fc = nn.Linear(self.hidden_size * 3, self.hidden_size, bias=False)
-        
+        hidden_size = target_cfg.hidden_size
+        self.hidden_size = hidden_size
+        self.vocab_size = target_cfg.vocab_size
+        self.draft_vocab_size = config.draft_vocab_size
+
+        self.midlayer = EagleDecoderLayeremb(target_cfg, config)
+        self.rotary_emb = LlamaRotaryEmbedding(target_cfg)
+        self.norm = LlamaRMSNorm(hidden_size, eps=target_cfg.rms_norm_eps)
+        self.fc = nn.Linear(hidden_size * 3, hidden_size, bias=False)
+        self.lm_head = nn.Linear(hidden_size, config.draft_vocab_size, bias=False)
+        self.register_buffer(
+            "ploss_weights",
+            torch.tensor([0.8**i for i in range(self.length)]),
+            persistent=False,
+        )
+
         try:
             with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
                 index_json = json.loads(f.read())
@@ -486,11 +550,7 @@ class Eagle3(nn.Module):
 
         assert tensor is not None, "Embedding tensor is None"
         self.embed_tokens = nn.Embedding(
-            self.vocab_size, self.hidden_size, self.padding_idx, _weight=tensor
-        )
-
-        self.lm_head = nn.Linear(
-            self.hidden_size, self.draft_vocab_size, bias=False
+            self.vocab_size, hidden_size, target_cfg.pad_token_id, _weight=tensor
         )
 
         compile_mode = "max-autotune-no-cudagraphs"
@@ -506,7 +566,7 @@ class Eagle3(nn.Module):
             cache = torch.load("cache.pt")
             d2t = cache["d2t"]
             t2d = cache["t2d"]
-        elif local_rank != 0:         
+        elif local_rank != 0:
             while not os.path.exists("cache.pt"):
                 time.sleep(1)
             cache = torch.load("cache.pt")
@@ -521,7 +581,8 @@ class Eagle3(nn.Module):
             num_proc = 48
 
             assistant_header_ids = tokenizer.encode(
-                "<|start_header_id|>assistant<|end_header_id|>\n\n", add_special_tokens=False
+                "<|start_header_id|>assistant<|end_header_id|>\n\n",
+                add_special_tokens=False,
             )
             eot_ids = tokenizer.encode("<|eot_id|>", add_special_tokens=False)
 
@@ -599,7 +660,9 @@ class Eagle3(nn.Module):
             top_draft_tokens = token_dict.most_common(self.draft_vocab_size)
             top_draft_tokens_frequency_sum = sum(freq for key, freq in top_draft_tokens)
             top_draft_tokens_ratio = top_draft_tokens_frequency_sum / total_frequency
-            print(f"top {self.draft_vocab_size} token frequency ratio: {top_draft_tokens_ratio:.2%}")
+            print(
+                f"top {self.draft_vocab_size} token frequency ratio: {top_draft_tokens_ratio:.2%}"
+            )
             used_tokens = [key for key, freq in top_draft_tokens]
             used_tokens.sort()
 
@@ -608,7 +671,7 @@ class Eagle3(nn.Module):
 
             d2t = torch.tensor(d2t)
             t2d = torch.tensor(t2d)
-            
+
             cache = {"d2t": d2t, "t2d": t2d}
             torch.save(cache, "cache.pt")
 
@@ -619,10 +682,16 @@ class Eagle3(nn.Module):
         self.register_buffer("t2d", t2d)
 
         actual_draft_vocab_size = int(t2d.sum().item())
-        assert actual_draft_vocab_size == self.draft_vocab_size, f"actual draft_vocab_size ({actual_draft_vocab_size}) != draft_vocab_size ({self.draft_vocab_size})"
+        assert actual_draft_vocab_size == self.draft_vocab_size, (
+            f"actual draft_vocab_size ({actual_draft_vocab_size}) != draft_vocab_size ({self.draft_vocab_size})"
+        )
 
     def _prepare_decoder_attention_mask(
-        self, attention_mask: Optional[torch.Tensor], input_shape: Tuple[int, int], inputs_embeds: torch.Tensor, past_key_values_length: int = 0
+        self,
+        attention_mask: Optional[torch.Tensor],
+        input_shape: Tuple[int, int],
+        inputs_embeds: torch.Tensor,
+        past_key_values_length: int = 0,
     ):
         # create causal mask
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
@@ -649,7 +718,12 @@ class Eagle3(nn.Module):
         return combined_attention_mask
 
     @torch.no_grad()
-    def dataprepare(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, loss_mask: torch.Tensor):
+    def dataprepare(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ):
         device = input_ids.device
         target_model = self._target_model
         model_device = next(target_model.parameters()).device
@@ -658,8 +732,12 @@ class Eagle3(nn.Module):
             self._target_model = target_model
 
         self._captured_hidden_states.clear()
-        outs = target_model(input_ids=input_ids, attention_mask=attention_mask,
-                            output_hidden_states=False, use_cache=False)
+        outs = target_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=False,
+            use_cache=False,
+        )
         hidden_states = torch.cat(
             [self._captured_hidden_states[i] for i in self._aux_layer_indices], dim=-1
         )
@@ -700,11 +778,15 @@ class Eagle3(nn.Module):
             use_cache = False
 
         if position_ids is None:
-            position_ids = torch.arange(
-                seq_length,
-                device=hidden_states.device,
-                dtype=torch.long,
-            ).unsqueeze(0).expand(batch_size, -1)
+            position_ids = (
+                torch.arange(
+                    seq_length,
+                    device=hidden_states.device,
+                    dtype=torch.long,
+                )
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
 
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
@@ -721,8 +803,8 @@ class Eagle3(nn.Module):
             all_target_head = []
             all_target_p_argmax = []
             for idx in range(self.length):
-                cur_target = padded_target[:, idx:idx + seq_length]
-                cur_loss_mask = padded_loss_mask[:, idx:idx + seq_length]
+                cur_target = padded_target[:, idx : idx + seq_length]
+                cur_loss_mask = padded_loss_mask[:, idx : idx + seq_length]
                 target_max_token = cur_target.argmax(-1)
                 target_mask = self.t2d[target_max_token][..., None].int()
                 position_mask = target_mask * cur_loss_mask
@@ -734,8 +816,7 @@ class Eagle3(nn.Module):
         plosses = []
         acces = []
         for idx in range(self.length):
-
-            inputs_embeds = all_embeds[:, idx:idx + seq_length]
+            inputs_embeds = all_embeds[:, idx : idx + seq_length]
 
             hidden_states = self.midlayer(
                 input_emb=inputs_embeds,
@@ -753,12 +834,17 @@ class Eagle3(nn.Module):
             logits = logits.float()
 
             position_mask = all_position_mask[idx]
-            loss = LogSoftmaxLoss.apply(logits, all_target_head[idx].float(), position_mask)
+            loss = LogSoftmaxLoss.apply(
+                logits, all_target_head[idx].float(), position_mask
+            )
 
             plosses.append(loss)
 
-            acc_num = ((logits.argmax(-1) == all_target_p_argmax[idx]) * position_mask.squeeze(-1)).sum()
-            acc_den = padded_loss_mask[:, idx:idx + seq_length].sum() + 1e-6
+            acc_num = (
+                (logits.argmax(-1) == all_target_p_argmax[idx])
+                * position_mask.squeeze(-1)
+            ).sum()
+            acc_den = padded_loss_mask[:, idx : idx + seq_length].sum() + 1e-6
             acces.append(acc_num / acc_den)
 
         acces = [a.item() for a in acces]
@@ -769,12 +855,14 @@ class Eagle3(nn.Module):
 def count_parameters(model: nn.Module):
     return sum(p.numel() for p in model.parameters())
 
+
 def print_model_summary(model: nn.Module):
     print(model)
 
+
 if __name__ == "__main__":
-    config = EagleConfig.from_pretrained('config.json')
-    ds_config = json.load(open('ds_config.json'))
+    config = EagleConfig.from_json("config.json")
+    ds_config = json.load(open("ds_config.json"))
     training_config = {
         "bs": ds_config["train_micro_batch_size_per_gpu"],
         "num_epochs": 1,

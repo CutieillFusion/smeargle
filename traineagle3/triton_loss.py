@@ -102,9 +102,9 @@ def log_softmax_forward_kernel(
         logits_block = tl.load(logits_ptr + offsets, mask=mask, other=0.0).cast(
             tl.float32
         )
-        target_block = tl.load(target_ptr + offsets, mask=mask, other=float("-inf")).cast(
-            tl.float32
-        )
+        target_block = tl.load(
+            target_ptr + offsets, mask=mask, other=float("-inf")
+        ).cast(tl.float32)
         target_softmax = tl.exp(target_block - tm) / td
         log_softmax_logits = (logits_block - m) - log_normalizer
         weighted_log_prob = target_softmax * log_softmax_logits
@@ -167,9 +167,9 @@ def log_softmax_backward_kernel(
     for i in range(0, n_cols, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_cols
-        target_block = tl.load(target_ptr + offsets, mask=mask, other=float("-inf")).cast(
-            tl.float32
-        )
+        target_block = tl.load(
+            target_ptr + offsets, mask=mask, other=float("-inf")
+        ).cast(tl.float32)
         target_softmax = tl.exp(target_block - tm) / td
         target_grad_sum += tl.sum(tl.where(mask, target_softmax * grad_output, 0.0))
 
@@ -180,9 +180,9 @@ def log_softmax_backward_kernel(
         logits_block = tl.load(logits_ptr + offsets, mask=mask, other=0.0).cast(
             tl.float32
         )
-        target_block = tl.load(target_ptr + offsets, mask=mask, other=float("-inf")).cast(
-            tl.float32
-        )
+        target_block = tl.load(
+            target_ptr + offsets, mask=mask, other=float("-inf")
+        ).cast(tl.float32)
         target_softmax = tl.exp(target_block - tm) / td
         softmax_prob = tl.exp(logits_block - m) / d
         normalized_grad = softmax_prob * target_grad_sum
@@ -223,7 +223,9 @@ class LogSoftmaxLoss(torch.autograd.Function):
             num_warps=num_warps,
         )
         n_valid = position_mask_flat.sum().float().clamp(min=1)
-        ctx.save_for_backward(logits.detach(), target, position_mask, m, d, tm, td, n_valid)
+        ctx.save_for_backward(
+            logits.detach(), target, position_mask, m, d, tm, td, n_valid
+        )
         return loss.sum() / n_valid
 
     @staticmethod

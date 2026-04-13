@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch LLaMA model."""
+
 import time
 import json
 from typing import List, Optional, Tuple
@@ -35,19 +36,31 @@ from safetensors import safe_open
 from datasets import load_dataset
 import multiprocessing
 from transformers.models.mamba2.modeling_mamba2 import Mamba2Cache, Mamba2Block
+from transformers.models.mamba2.configuration_mamba2 import Mamba2Config
 from transformers.integrations import use_kernel_forward_from_hub
 
 
 class Mamba2(nn.Module):
     """MAMBA2 with cache support."""
 
-    def __init__(self, config: SmeargleConfig):
+    def __init__(self, draft_config, target_config):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.residual_size
-
-        self.mamba2 = Mamba2Block(config, layer_idx=0)
-        self.out_proj = nn.Linear(config.hidden_size, config.residual_size, bias=False)
+        self.hidden_size = target_config.hidden_size
+        mamba2_config = Mamba2Config(
+            hidden_size=target_config.hidden_size * draft_config.expand,
+            num_heads=draft_config.num_heads,
+            head_dim=draft_config.head_dim,
+            state_size=draft_config.state_size,
+            expand=draft_config.expand,
+            conv_kernel=draft_config.conv_kernel,
+            n_groups=draft_config.n_groups,
+            chunk_size=draft_config.chunk_size,
+            num_hidden_layers=1,
+            residual_in_fp32=True,
+            layer_norm_epsilon=target_config.rms_norm_eps,
+        )
+        self.mamba2 = Mamba2Block(mamba2_config, layer_idx=0)
+        self.out_proj = nn.Linear(mamba2_config.hidden_size, target_config.hidden_size, bias=False)
 
     def forward(
         self,
@@ -55,7 +68,6 @@ class Mamba2(nn.Module):
         cache_params: Optional[Mamba2Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
-
         output = self.mamba2(
             hidden_states=hidden_states,
             cache_params=cache_params,
@@ -70,10 +82,10 @@ class Mamba2(nn.Module):
 
 
 class LlamaMLP(nn.Module):
-    def __init__(self, config: SmeargleConfig):
+    def __init__(self, config):
         super().__init__()
         self.config = config
-        self.hidden_size = config.residual_size
+        self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
@@ -107,16 +119,18 @@ class LlamaRMSNorm(nn.Module):
 
 
 class SmeargleDecoderLayeremb(nn.Module):
-    def __init__(self, config: SmeargleConfig):
+    def __init__(self, draft_config, target_config):
         super().__init__()
-        self.hidden_size = config.residual_size
-        self.mamba2 = Mamba2(config=config)
-        self.mlp = LlamaMLP(config)
-        self.hidden_norm = LlamaRMSNorm(config.residual_size, eps=config.rms_norm_eps)
-        self.input_layernorm = LlamaRMSNorm(config.residual_size, eps=config.rms_norm_eps)
+        self.hidden_size = target_config.hidden_size
+        self.mamba2 = Mamba2(draft_config, target_config)
+        self.mlp = LlamaMLP(target_config)
+        self.hidden_norm = LlamaRMSNorm(target_config.hidden_size, eps=target_config.rms_norm_eps)
+        self.input_layernorm = LlamaRMSNorm(
+            target_config.hidden_size, eps=target_config.rms_norm_eps
+        )
 
         self.post_attention_layernorm = LlamaRMSNorm(
-            config.residual_size, eps=config.rms_norm_eps
+            target_config.hidden_size, eps=target_config.rms_norm_eps
         )
 
     def forward(
@@ -129,9 +143,7 @@ class SmeargleDecoderLayeremb(nn.Module):
         hidden_states = self.hidden_norm(hidden_states)
         input_emb = self.input_layernorm(input_emb)
 
-        hidden_states = torch.cat(
-            (input_emb, hidden_states), dim=-1
-        )
+        hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
 
         # MAMBA block
         hidden_states = self.mamba2(
@@ -180,12 +192,11 @@ def merge_dicts(dicts):
     return result
 
 
-
 def _find_subsequence(seq, pattern):
     indices = []
     plen = len(pattern)
     for i in range(len(seq) - plen + 1):
-        if seq[i:i + plen] == pattern:
+        if seq[i : i + plen] == pattern:
             indices.append(i)
     return indices
 
@@ -216,17 +227,11 @@ class Eagle3(nn.Module):
     ):
         super().__init__()
         self.train_config = training_config
-        self.config = config
-        self.midlayer = SmeargleDecoderLayeremb(config)
+        self.draft_config = config
         self.gradient_checkpointing = self.train_config["gradient_checkpoint"]
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-        self.hidden_size = config.residual_size
-        self.draft_vocab_size = config.draft_vocab_size
-        self.norm = LlamaRMSNorm(config.residual_size, eps=config.rms_norm_eps)
         self.length = 7
-        self.register_buffer("ploss_weights", torch.tensor([0.8**i for i in range(self.length)]), persistent=False)
 
+        # Load target model first so we can use its config for building layers
         self._target_model = LlamaForCausalLM.from_pretrained(
             path, dtype=torch.bfloat16, low_cpu_mem_usage=True
         )
@@ -235,7 +240,9 @@ class Eagle3(nn.Module):
         for param in self._target_model.parameters():
             param.requires_grad = False
 
-        num_layers = self._target_model.config.num_hidden_layers
+        target_cfg = self._target_model.config
+
+        num_layers = target_cfg.num_hidden_layers
         self._aux_layer_indices = [1, num_layers // 2 - 1, num_layers - 4]
         self._captured_hidden_states = {}
 
@@ -245,15 +252,32 @@ class Eagle3(nn.Module):
                     self._captured_hidden_states[layer_idx] = output[0]
                 else:
                     self._captured_hidden_states[layer_idx] = output
+
             return hook
 
         for idx in self._aux_layer_indices:
             self._target_model.model.layers[idx].register_forward_hook(_make_hook(idx))
 
-        self._target_model = torch.compile(self._target_model, mode="max-autotune-no-cudagraphs")
+        self._target_model = torch.compile(
+            self._target_model, mode="max-autotune-no-cudagraphs"
+        )
 
-        self.fc = nn.Linear(self.hidden_size * 3, self.hidden_size, bias=False)
+        hidden_size = target_cfg.hidden_size
+        self.hidden_size = hidden_size
+        self.vocab_size = target_cfg.vocab_size
+        self.draft_vocab_size = config.draft_vocab_size
+        self.padding_idx = target_cfg.pad_token_id
 
+        self.midlayer = SmeargleDecoderLayeremb(config, target_cfg)
+        self.norm = LlamaRMSNorm(hidden_size, eps=target_cfg.rms_norm_eps)
+        self.fc = nn.Linear(hidden_size * 3, hidden_size, bias=False)
+        self.lm_head = nn.Linear(hidden_size, config.draft_vocab_size, bias=False)
+
+        self.register_buffer(
+            "ploss_weights",
+            torch.tensor([0.8**i for i in range(self.length)]),
+            persistent=False,
+        )
 
         try:
             with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
@@ -277,10 +301,6 @@ class Eagle3(nn.Module):
         assert tensor is not None, "Embedding tensor is None"
         self.embed_tokens = nn.Embedding(
             self.vocab_size, self.hidden_size, self.padding_idx, _weight=tensor
-        )
-
-        self.lm_head = nn.Linear(
-            self.hidden_size, self.draft_vocab_size, bias=False
         )
 
         compile_mode = "max-autotune-no-cudagraphs"
@@ -312,7 +332,8 @@ class Eagle3(nn.Module):
             num_proc = 48
 
             assistant_header_ids = tokenizer.encode(
-                "<|start_header_id|>assistant<|end_header_id|>\n\n", add_special_tokens=False
+                "<|start_header_id|>assistant<|end_header_id|>\n\n",
+                add_special_tokens=False,
             )
             eot_ids = tokenizer.encode("<|eot_id|>", add_special_tokens=False)
 
@@ -390,7 +411,9 @@ class Eagle3(nn.Module):
             top_draft_tokens = token_dict.most_common(self.draft_vocab_size)
             top_draft_tokens_frequency_sum = sum(freq for key, freq in top_draft_tokens)
             top_draft_tokens_ratio = top_draft_tokens_frequency_sum / total_frequency
-            print(f"top {self.draft_vocab_size} token frequency ratio: {top_draft_tokens_ratio:.2%}")
+            print(
+                f"top {self.draft_vocab_size} token frequency ratio: {top_draft_tokens_ratio:.2%}"
+            )
             used_tokens = [key for key, freq in top_draft_tokens]
             used_tokens.sort()
 
@@ -410,10 +433,17 @@ class Eagle3(nn.Module):
         self.register_buffer("t2d", t2d)
 
         actual_draft_vocab_size = int(t2d.sum().item())
-        assert actual_draft_vocab_size == self.draft_vocab_size, f"actual draft_vocab_size ({actual_draft_vocab_size}) != draft_vocab_size ({self.draft_vocab_size})"
+        assert actual_draft_vocab_size == self.draft_vocab_size, (
+            f"actual draft_vocab_size ({actual_draft_vocab_size}) != draft_vocab_size ({self.draft_vocab_size})"
+        )
 
     @torch.no_grad()
-    def dataprepare(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, loss_mask: torch.Tensor):
+    def dataprepare(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ):
         device = input_ids.device
         target_model = self._target_model
         model_device = next(target_model.parameters()).device
@@ -422,8 +452,12 @@ class Eagle3(nn.Module):
             self._target_model = target_model
 
         self._captured_hidden_states.clear()
-        outs = target_model(input_ids=input_ids, attention_mask=attention_mask,
-                            output_hidden_states=False, use_cache=False)
+        outs = target_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=False,
+            use_cache=False,
+        )
         hidden_states = torch.cat(
             [self._captured_hidden_states[i] for i in self._aux_layer_indices], dim=-1
         )
@@ -471,8 +505,8 @@ class Eagle3(nn.Module):
             all_target_head = []
             all_target_p_argmax = []
             for idx in range(self.length):
-                cur_target = padded_target[:, idx:idx + seq_length]
-                cur_loss_mask = padded_loss_mask[:, idx:idx + seq_length]
+                cur_target = padded_target[:, idx : idx + seq_length]
+                cur_loss_mask = padded_loss_mask[:, idx : idx + seq_length]
                 target_max_token = cur_target.argmax(-1)
                 target_mask = self.t2d[target_max_token][..., None].int()
                 position_mask = target_mask * cur_loss_mask
@@ -484,8 +518,7 @@ class Eagle3(nn.Module):
         plosses = []
         acces = []
         for idx in range(self.length):
-
-            inputs_embeds = all_embeds[:, idx:idx + seq_length]
+            inputs_embeds = all_embeds[:, idx : idx + seq_length]
 
             hidden_states = self.midlayer(
                 input_emb=inputs_embeds,
@@ -498,12 +531,17 @@ class Eagle3(nn.Module):
             logits = logits.float()
 
             position_mask = all_position_mask[idx]
-            loss = LogSoftmaxLoss.apply(logits, all_target_head[idx].float(), position_mask)
+            loss = LogSoftmaxLoss.apply(
+                logits, all_target_head[idx].float(), position_mask
+            )
 
             plosses.append(loss)
 
-            acc_num = ((logits.argmax(-1) == all_target_p_argmax[idx]) * position_mask.squeeze(-1)).sum()
-            acc_den = padded_loss_mask[:, idx:idx + seq_length].sum() + 1e-6
+            acc_num = (
+                (logits.argmax(-1) == all_target_p_argmax[idx])
+                * position_mask.squeeze(-1)
+            ).sum()
+            acc_den = padded_loss_mask[:, idx : idx + seq_length].sum() + 1e-6
             acces.append(acc_num / acc_den)
 
         acces = [a.item() for a in acces]
@@ -514,12 +552,14 @@ class Eagle3(nn.Module):
 def count_parameters(model: nn.Module):
     return sum(p.numel() for p in model.parameters())
 
+
 def print_model_summary(model: nn.Module):
     print(model)
 
+
 if __name__ == "__main__":
-    config = SmeargleConfig.from_pretrained('config.json')
-    ds_config = json.load(open('ds_config.json'))
+    config = SmeargleConfig.from_json("config.json")
+    ds_config = json.load(open("ds_config.json"))
     training_config = {
         "bs": ds_config["train_micro_batch_size_per_gpu"],
         "num_epochs": 1,
