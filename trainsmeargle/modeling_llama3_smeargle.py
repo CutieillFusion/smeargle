@@ -47,7 +47,7 @@ class Mamba2(nn.Module):
         super().__init__()
         mamba2_config = Mamba2Config(
             hidden_size=target_config.hidden_size * 2,
-            num_heads=target_config.num_attention_heads,
+            num_heads=target_config.num_attention_heads * 2,
             head_dim=(target_config.hidden_size * 2) // target_config.num_attention_heads,
             state_size=draft_config.state_size,
             expand=draft_config.expand,
@@ -58,7 +58,7 @@ class Mamba2(nn.Module):
             residual_in_fp32=True,
             layer_norm_epsilon=target_config.rms_norm_eps,
         )
-        assert mamba2_config.hidden_size * mamba2_config.expand == target_config.num_attention_heads * mamba2_config.head_dim, f"mamba2_config.hidden_size * mamba2_config.expand ({mamba2_config.hidden_size * mamba2_config.expand}) != target_config.num_attention_heads * mamba2_config.head_dim ({target_config.num_attention_heads * mamba2_config.head_dim})"
+        assert mamba2_config.hidden_size * mamba2_config.expand == mamba2_config.num_heads * mamba2_config.head_dim, f"mamba2_config.hidden_size * mamba2_config.expand ({mamba2_config.hidden_size * mamba2_config.expand}) != target_config.num_attention_heads * mamba2_config.head_dim ({target_config.num_attention_heads * mamba2_config.head_dim})"
         self.mamba2 = Mamba2Block(mamba2_config, layer_idx=0)
         self.out_proj = nn.Linear(mamba2_config.hidden_size, target_config.hidden_size, bias=False)
 

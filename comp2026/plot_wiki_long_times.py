@@ -28,11 +28,15 @@ def load_questions(question_file):
     return mapping
 
 
+LABEL_MAP = {"eagle3": "Eagle", "smeargle": "Smeargle"}
+
+
 def label_from_file(f):
     name = f.stem
     if "_window_" in name:
         return name.split("_window_")[-1]
-    return name.replace("llama_3_1_8b_instruct_", "").split("_temperature")[0]
+    raw = name.replace("llama_3_1_8b_instruct_", "").split("_temperature")[0]
+    return LABEL_MAP.get(raw, raw)
 
 
 def _window_sort_key(f):
@@ -109,12 +113,14 @@ def main():
             oom_vlines.append((5, model_label, color))
 
     ax.set_xlabel("Prompt Length")
-    ax.set_ylabel("Empirical c")
-    ax.set_title("Empirical c (WikiLong)")
+    ax.set_ylabel("Target to Draft Ratio")
+    ax.set_title("Runtime Ratio")
     ax.set_xticks(x)
     ax.set_xticklabels([CATEGORY_LABELS[c] for c in categories])
     ax.legend()
     ax.set_ylim(bottom=0)
+    ax.set_facecolor("#f5f5f5")
+    ax.grid(True, alpha=0.3)
 
     # Draw OOM vertical lines after axis limits are set (one per x-position)
     seen_oom_x = set()
@@ -123,7 +129,7 @@ def main():
             continue
         seen_oom_x.add(vline_x)
         ax.axvline(x=vline_x, color="red", linestyle=":", linewidth=1.5)
-        ax.text(vline_x + 0.05, ax.get_ylim()[1] * 0.95, "OOM",
+        ax.text(vline_x + 0.05, ax.get_ylim()[1] * 0.95, f"{label} OOM",
                 color="red", fontsize=8, ha="left", va="top", rotation=90)
 
     plt.tight_layout()

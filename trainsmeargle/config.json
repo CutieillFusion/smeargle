@@ -4,5 +4,5 @@
   "chunk_size": 256,
   "conv_kernel": 4,
   "n_groups": 1,
-  "expand": 1
+  "expand": 2
 }

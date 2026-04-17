@@ -10,6 +10,9 @@ uv run plot_wiki_long_times.py --data-dir "sliding_window" --question-file "slid
 uv run plot_wiki_long_memory.py --data-dir "sliding_window" --question-file "sliding_window/question.jsonl" --output "sliding_window/memory.png"
 uv run plot_wiki_long_energy.py --data-dir "sliding_window" --question-file "sliding_window/question.jsonl" --output "sliding_window/energy.png"
 
+# Per-category speedup vs window size
+uv run plot_sliding_window_speedup.py --data-dir "sliding_window" --question-file "sliding_window/question.jsonl"
+
 # Per-window acceptance rate plots
 for ws in "${window_sizes[@]}"; do
     uv run plot_wiki_long_acceptance.py --data-dir "sliding_window" --question-file "sliding_window/question.jsonl" --output "sliding_window/acceptance_window_${ws}.png" --file-filter "window_${ws}."

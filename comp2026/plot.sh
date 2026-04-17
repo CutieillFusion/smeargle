@@ -7,3 +7,4 @@ uv run plot_wiki_long_acceptance.py
 uv run plot_wiki_long_times.py
 uv run plot_wiki_long_memory.py
 uv run plot_wiki_long_energy.py
+uv run plot_wiki_long_tokens_per_question.py

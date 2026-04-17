@@ -45,11 +45,15 @@ def cumulative_acceptance_rate(counts):
     return cumulative
 
 
+LABEL_MAP = {"eagle3": "Eagle", "smeargle": "Smeargle"}
+
+
 def label_from_file(f):
     name = f.stem
     if "_window_" in name:
         return name.split("_window_")[-1]
-    return name.replace("llama_3_1_8b_instruct_", "").split("_temperature")[0]
+    raw = name.replace("llama_3_1_8b_instruct_", "").split("_temperature")[0]
+    return LABEL_MAP.get(raw, raw)
 
 
 def _window_sort_key(f):

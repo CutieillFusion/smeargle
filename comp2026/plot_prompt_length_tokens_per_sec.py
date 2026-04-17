@@ -29,22 +29,6 @@ def load_jsonl(path):
     return data
 
 
-def compute_avg_acceptance_length(data, qid_to_cat):
-    """Compute average acceptance length per category."""
-    cat_total = defaultdict(float)
-    cat_count = defaultdict(float)
-    for dp in data:
-        qid = dp["question_id"]
-        cat = qid_to_cat.get(qid)
-        if cat is None or dp.get("skipped") == "OOM":
-            continue
-        al = dp["choices"][0].get("acceptance_lengths", {})
-        for pos_str, count in al.items():
-            cat_total[cat] += int(pos_str) * count
-            cat_count[cat] += count
-    return {cat: cat_total[cat] / cat_count[cat] for cat in cat_total if cat_count[cat] > 0}
-
-
 def compute_speeds_by_category(data, qid_to_cat, tokenizer=None):
     """Compute aggregate tokens/sec per category.
 
@@ -81,11 +65,11 @@ def compute_speeds_by_category(data, qid_to_cat, tokenizer=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot per-category speedup for WikiLong")
+    parser = argparse.ArgumentParser(description="Plot per-category tokens/sec for WikiLong")
     parser.add_argument("--data-dir", type=str, default="wiki_long/")
     parser.add_argument("--question-file", type=str, default="wiki_long/question.jsonl")
     parser.add_argument("--tokenizer-path", type=str, default="../models/llama_3_1_8b_instruct")
-    parser.add_argument("--output", type=str, default="wiki_long/category_speedup.png")
+    parser.add_argument("--output", type=str, default="wiki_long/category_tokens_per_sec.png")
     parser.add_argument("--file-filter", type=str, default=None,
                         help="Only include spec files whose filename contains this substring")
     args = parser.parse_args()
@@ -132,56 +116,52 @@ def main():
     baseline_data = load_jsonl(baseline_file)
     baseline_speeds, _ = compute_speeds_by_category(baseline_data, qid_to_cat, tokenizer=tokenizer)
 
-    # Compute speeds for all models (including baseline for verification)
+    # Compute speeds for all models (including baseline)
     model_speeds = {}
     model_ooms = {}
 
-    model_speeds[label_from_file(baseline_file)] = baseline_speeds
-    model_ooms[label_from_file(baseline_file)] = {}
-    model_acc_len = {}
+    baseline_label = label_from_file(baseline_file)
+    model_speeds[baseline_label] = baseline_speeds
+    model_ooms[baseline_label] = {}
     for f in spec_files:
         data = load_jsonl(f)
         speeds, oom_counts = compute_speeds_by_category(data, qid_to_cat, tokenizer=None)
         model_speeds[label_from_file(f)] = speeds
         model_ooms[label_from_file(f)] = oom_counts
-        model_acc_len[label_from_file(f)] = compute_avg_acceptance_length(data, qid_to_cat)
 
-    # Compute speedup ratios for spec models only (exclude baseline)
-    spec_names = [m for m in model_speeds if m != label_from_file(baseline_file)]
-    speedups = {}
-    for model in spec_names:
-        speedups[model] = {}
-        for cat in categories:
-            if cat not in baseline_speeds or cat not in model_speeds[model]:
-                continue
-            speedups[model][cat] = model_speeds[model][cat] / baseline_speeds[cat]
+    # Plot order: baseline first, then spec models
+    spec_names = [m for m in model_speeds if m != baseline_label]
+    all_names = [baseline_label] + spec_names
 
-    # Plot line chart (similar to acceptance rate plots)
+    # Plot line chart
     short_labels = [c.replace("long_context_", "") for c in categories]
     x = range(len(categories))
     colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2", "#937860", "#DA8BC3", "#8C8C8C", "#CCB974"]
 
+    display_names = {"eagle3": "Eagle", "smeargle": "Smeargle", "baseline": "Baseline"}
+
     fig, ax = plt.subplots(figsize=(8, 5))
     oom_vlines = []
-    for i, model in enumerate(spec_names):
+    for i, model in enumerate(all_names):
         color = colors[i % len(colors)]
         plot_x, plot_y = [], []
         for j, cat in enumerate(categories):
-            if cat in speedups[model]:
+            if cat in model_speeds[model]:
                 plot_x.append(j)
-                plot_y.append(speedups[model][cat])
+                plot_y.append(model_speeds[model][cat])
 
-        ax.plot(plot_x, plot_y, marker="o", label=model, color=color)
-        # Track where model fully OOMs for vertical line
-        full_oom_cats = [cat for cat in categories if model_ooms[model].get(cat, 0) > 0 and cat not in speedups[model]]
-        if full_oom_cats:
-            first_full_oom_idx = categories.index(full_oom_cats[0])
-            oom_vlines.append((5, model, color))
+        linestyle = "--" if model == baseline_label else "-"
+        display = display_names.get(model, model)
+        ax.plot(plot_x, plot_y, marker="o", linestyle=linestyle, label=display, color=color)
+        # Track where eagle fully OOMs for vertical line
+        if "eagle" in model:
+            last_valid_idx = max(plot_x) if plot_x else None
+            if last_valid_idx is not None and last_valid_idx < len(categories) - 1:
+                oom_vlines.append((last_valid_idx, model, color))
 
-    ax.axhline(y=1.0, color="gray", linestyle="--", linewidth=1, label="baseline (1x)")
     ax.set_xlabel("Prompt Length")
-    ax.set_ylabel("Speedup Factor")
-    ax.set_title("Per-Prompt-Length Speedup (WikiLong)")
+    ax.set_ylabel("Tokens/sec")
+    ax.set_title("Per-Prompt-Length Tokens/sec (WikiLong)")
     ax.set_xticks(list(x))
     ax.set_xticklabels(short_labels)
     ax.legend()
@@ -195,28 +175,12 @@ def main():
             continue
         seen_oom_x.add(vline_x)
         ax.axvline(x=vline_x, color="red", linestyle=":", linewidth=1.5)
-        ax.text(vline_x + 0.05, ax.get_ylim()[1] * 0.95, "OOM",
+        ax.text(vline_x + 0.05, ax.get_ylim()[1] * 0.95, "EAGLE OOM",
                 color="red", fontsize=8, ha="left", va="top", rotation=90)
 
     plt.tight_layout()
     plt.savefig(args.output, dpi=150)
     print(f"Saved plot to {args.output}")
-
-    # Write speedup and tokens/s to a JSON file
-    json_output = Path(args.output).with_suffix(".json")
-    results = {}
-    results["baseline"] = {cat: baseline_speeds.get(cat) for cat in categories if cat in baseline_speeds}
-    for model in spec_names:
-        results[model] = {}
-        for cat in categories:
-            results[model][cat] = {
-                "tokens_per_sec": model_speeds[model].get(cat),
-                "speedup": speedups[model].get(cat),
-                "avg_acceptance_length": model_acc_len.get(model, {}).get(cat),
-            }
-    with open(json_output, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
-    print(f"Saved data to {json_output}")
 
 
 if __name__ == "__main__":
