@@ -22,6 +22,14 @@ datasets/*
 !datasets/pyproject.toml
 !datasets/download_datasets.py
 !datasets/uv.lock
+!datasets/_bench_utils.py
+!datasets/_grade_utils.py
+!datasets/prepare_llama31_benchmarks.py
+!datasets/grade_llama31_benchmarks.py
+!datasets/*/
+datasets/*/*
+!datasets/*/prepare.py
+!datasets/*/grade.py
 
 # Models
 models/*
