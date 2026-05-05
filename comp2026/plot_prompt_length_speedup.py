@@ -161,8 +161,10 @@ def main():
     x = range(len(categories))
     colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2", "#937860", "#DA8BC3", "#8C8C8C", "#CCB974"]
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    oom_vlines = []
+    # Precompute per-model line data and OOM x positions
+    model_lines = {}
+    oom_positions = set()
+    global_ymax = 1.0
     for i, model in enumerate(spec_names):
         color = colors[i % len(colors)]
         plot_x, plot_y = [], []
@@ -170,37 +172,60 @@ def main():
             if cat in speedups[model]:
                 plot_x.append(j)
                 plot_y.append(speedups[model][cat])
-
-        ax.plot(plot_x, plot_y, marker="o", label=model, color=color)
-        # Track where model fully OOMs for vertical line
+        model_lines[model] = (plot_x, plot_y, color)
+        if plot_y:
+            global_ymax = max(global_ymax, max(plot_y))
         full_oom_cats = [cat for cat in categories if model_ooms[model].get(cat, 0) > 0 and cat not in speedups[model]]
         if full_oom_cats:
-            first_full_oom_idx = categories.index(full_oom_cats[0])
-            oom_vlines.append((5, model, color))
+            oom_positions.add(5)
 
-    ax.axhline(y=1.0, color="gray", linestyle="--", linewidth=1, label="baseline (1x)")
-    ax.set_xlabel("Prompt Length")
-    ax.set_ylabel("Speedup Factor")
-    ax.set_title("Per-Prompt-Length Speedup (WikiLong)")
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(short_labels)
-    ax.legend()
-    ax.set_ylim(bottom=0)
-    ax.grid(True)
+    ordered_models = ["eagle3", "smeargle"]
+    # Frame contents: which models have their real line drawn, and whether OOM marker is shown.
+    # Order per user: baseline -> +eagle -> +OOM -> +smeargle
+    frames = [
+        {"models": set(), "oom": False},
+        {"models": {"eagle3"}, "oom": False},
+        {"models": {"eagle3"}, "oom": True},
+        {"models": {"eagle3", "smeargle"}, "oom": True},
+    ]
 
-    # Draw OOM vertical lines after axis limits are set (one per x-position)
-    seen_oom_x = set()
-    for vline_x, label, color in oom_vlines:
-        if vline_x in seen_oom_x:
-            continue
-        seen_oom_x.add(vline_x)
-        ax.axvline(x=vline_x, color="red", linestyle=":", linewidth=1.5)
-        ax.text(vline_x + 0.05, ax.get_ylim()[1] * 0.95, "OOM",
-                color="red", fontsize=8, ha="left", va="top", rotation=90)
+    ylim_top = global_ymax * 1.05
+    output_path = Path(args.output)
 
-    plt.tight_layout()
-    plt.savefig(args.output, dpi=150)
-    print(f"Saved plot to {args.output}")
+    for step_idx, frame in enumerate(frames, start=1):
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+        for model in ordered_models:
+            if model not in model_lines:
+                continue
+            plot_x, plot_y, color = model_lines[model]
+            if model in frame["models"]:
+                ax.plot(plot_x, plot_y, marker="o", label=model, color=color)
+            else:
+                # Placeholder so legend stays identical across frames
+                ax.plot([], [], marker="o", color=color, label=model)
+
+        ax.axhline(y=1.0, color="gray", linestyle="--", linewidth=1, label="baseline (1x)")
+        ax.set_xlabel("Prompt Length")
+        ax.set_ylabel("Speedup Factor")
+        ax.set_title("Per-Prompt-Length Speedup (WikiLong)")
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(short_labels)
+        ax.set_ylim(0, ylim_top)
+        ax.grid(True)
+
+        if frame["oom"]:
+            for vline_x in oom_positions:
+                ax.axvline(x=vline_x, color="red", linestyle=":", linewidth=1.5)
+                ax.text(vline_x + 0.05, ylim_top * 0.95, "OOM",
+                        color="red", fontsize=8, ha="left", va="top", rotation=90)
+
+        ax.legend()
+        plt.tight_layout()
+        step_output = output_path.with_name(f"{output_path.stem}_step{step_idx}{output_path.suffix}")
+        plt.savefig(step_output, dpi=150)
+        plt.close(fig)
+        print(f"Saved plot to {step_output}")
 
     # Write speedup and tokens/s to a JSON file
     json_output = Path(args.output).with_suffix(".json")

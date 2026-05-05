@@ -82,14 +82,14 @@ def main():
     if args.file_filter:
         spec_files = [f for f in spec_files if args.file_filter in f.name]
 
-    fig, axes = plt.subplots(1, len(spec_files), figsize=(8 * len(spec_files), 5), squeeze=False)
+    legend_cats = list(CATEGORY_ORDER)
+    subsets = [legend_cats[:i] for i in range(1, len(legend_cats) + 1)]
 
-    for col, f in enumerate(spec_files):
-        ax = axes[0, col]
+    # Precompute per-file rates and OOM counts for all legend categories
+    per_file = []
+    global_xmax = 0
+    for f in spec_files:
         data = load_jsonl(f)
-        model_label = label_from_file(f)
-
-        # Group data by category, count OOMs
         cat_data = defaultdict(list)
         cat_oom = defaultdict(int)
         for dp in data:
@@ -102,30 +102,51 @@ def main():
             else:
                 cat_data[cat].append(dp)
 
-        for cat in CATEGORY_ORDER:
+        cat_rates = {}
+        for cat in legend_cats:
             if cat not in cat_data:
-                # Full OOM — add legend entry noting OOM
-                if cat_oom.get(cat, 0) > 0:
-                    ax.plot([], [], marker="None", color=CATEGORY_COLORS[cat], linestyle="None",
-                            label=f"{CATEGORY_LABELS[cat]} (OOM)")
                 continue
             counts = aggregate_acceptance_lengths(cat_data[cat])
             last_nonzero = np.max(np.nonzero(counts)) + 1 if np.any(counts) else 1
             counts = counts[:last_nonzero]
             rate = cumulative_acceptance_rate(counts)
-            ax.plot(range(len(rate)), rate, marker="o",
-                    label=CATEGORY_LABELS[cat], color=CATEGORY_COLORS[cat])
+            cat_rates[cat] = rate
+            global_xmax = max(global_xmax, len(rate) - 1)
+        per_file.append((f, cat_rates, cat_oom))
 
-        ax.set_xlabel("Position")
-        ax.set_ylabel("Acceptance Rate")
-        ax.set_title(f"Acceptance Rate Per Position ({model_label})")
-        ax.set_ylim(0, 1.05)
-        ax.grid(True)
-        ax.legend()
+    output_path = Path(args.output)
+    for step_idx, subset in enumerate(subsets, start=1):
+        fig, axes = plt.subplots(1, len(spec_files), figsize=(8 * len(spec_files), 5), squeeze=False)
+        for col, (f, cat_rates, cat_oom) in enumerate(per_file):
+            ax = axes[0, col]
+            model_label = label_from_file(f)
 
-    plt.tight_layout()
-    plt.savefig(args.output, dpi=150)
-    print(f"Saved plot to {args.output}")
+            for cat in legend_cats:
+                if cat in subset and cat in cat_rates:
+                    rate = cat_rates[cat]
+                    ax.plot(range(len(rate)), rate, marker="o",
+                            label=CATEGORY_LABELS[cat], color=CATEGORY_COLORS[cat])
+                elif cat in subset and cat_oom.get(cat, 0) > 0:
+                    ax.plot([], [], marker="None", color=CATEGORY_COLORS[cat], linestyle="None",
+                            label=f"{CATEGORY_LABELS[cat]} (OOM)")
+                else:
+                    # Placeholder so legend stays identical across frames
+                    ax.plot([], [], marker="o", color=CATEGORY_COLORS[cat],
+                            label=CATEGORY_LABELS[cat])
+
+            ax.set_xlabel("Position")
+            ax.set_ylabel("Acceptance Rate")
+            ax.set_title(f"Acceptance Rate Per Position ({model_label})")
+            ax.set_xlim(-0.5, global_xmax + 0.5)
+            ax.set_ylim(0, 1.05)
+            ax.grid(True)
+            ax.legend()
+
+        plt.tight_layout()
+        step_output = output_path.with_name(f"{output_path.stem}_step{step_idx}{output_path.suffix}")
+        plt.savefig(step_output, dpi=150)
+        plt.close(fig)
+        print(f"Saved plot to {step_output}")
 
 
 if __name__ == "__main__":

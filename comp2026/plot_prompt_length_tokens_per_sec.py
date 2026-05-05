@@ -140,8 +140,10 @@ def main():
 
     display_names = {"eagle3": "Eagle", "smeargle": "Smeargle", "baseline": "Baseline"}
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    oom_vlines = []
+    # Precompute per-model line data, OOM x positions, and global y-axis
+    model_lines = {}
+    oom_positions = set()
+    global_ymax = 0.0
     for i, model in enumerate(all_names):
         color = colors[i % len(colors)]
         plot_x, plot_y = [], []
@@ -149,38 +151,62 @@ def main():
             if cat in model_speeds[model]:
                 plot_x.append(j)
                 plot_y.append(model_speeds[model][cat])
-
         linestyle = "--" if model == baseline_label else "-"
-        display = display_names.get(model, model)
-        ax.plot(plot_x, plot_y, marker="o", linestyle=linestyle, label=display, color=color)
-        # Track where eagle fully OOMs for vertical line
+        model_lines[model] = (plot_x, plot_y, color, linestyle)
+        if plot_y:
+            global_ymax = max(global_ymax, max(plot_y))
         if "eagle" in model:
             last_valid_idx = max(plot_x) if plot_x else None
             if last_valid_idx is not None and last_valid_idx < len(categories) - 1:
-                oom_vlines.append((last_valid_idx, model, color))
+                oom_positions.add(last_valid_idx)
 
-    ax.set_xlabel("Prompt Length")
-    ax.set_ylabel("Tokens/sec")
-    ax.set_title("Per-Prompt-Length Tokens/sec (WikiLong)")
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(short_labels)
-    ax.legend()
-    ax.set_ylim(bottom=0)
-    ax.grid(True)
+    # Frame contents per user order: baseline -> +eagle -> +OOM -> +smeargle
+    frames = [
+        {"models": {baseline_label}, "oom": False},
+        {"models": {baseline_label, "eagle3"}, "oom": False},
+        {"models": {baseline_label, "eagle3"}, "oom": True},
+        {"models": {baseline_label, "eagle3", "smeargle"}, "oom": True},
+    ]
 
-    # Draw OOM vertical lines after axis limits are set (one per x-position)
-    seen_oom_x = set()
-    for vline_x, label, color in oom_vlines:
-        if vline_x in seen_oom_x:
-            continue
-        seen_oom_x.add(vline_x)
-        ax.axvline(x=vline_x, color="red", linestyle=":", linewidth=1.5)
-        ax.text(vline_x + 0.05, ax.get_ylim()[1] * 0.95, "EAGLE OOM",
-                color="red", fontsize=8, ha="left", va="top", rotation=90)
+    ylim_top = global_ymax * 1.05
+    output_path = Path(args.output)
 
-    plt.tight_layout()
-    plt.savefig(args.output, dpi=150)
-    print(f"Saved plot to {args.output}")
+    for step_idx, frame in enumerate(frames, start=1):
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+        for model in all_names:
+            if model not in model_lines:
+                continue
+            plot_x, plot_y, color, linestyle = model_lines[model]
+            display = display_names.get(model, model)
+            if model in frame["models"]:
+                ax.plot(plot_x, plot_y, marker="o", linestyle=linestyle,
+                        label=display, color=color)
+            else:
+                # Placeholder so legend stays identical across frames
+                ax.plot([], [], marker="o", linestyle=linestyle,
+                        label=display, color=color)
+
+        ax.set_xlabel("Prompt Length")
+        ax.set_ylabel("Tokens/sec")
+        ax.set_title("Per-Prompt-Length Tokens/sec (WikiLong)")
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(short_labels)
+        ax.set_ylim(0, ylim_top)
+        ax.grid(True)
+
+        if frame["oom"]:
+            for vline_x in oom_positions:
+                ax.axvline(x=vline_x, color="red", linestyle=":", linewidth=1.5)
+                ax.text(vline_x + 0.05, ylim_top * 0.95, "EAGLE OOM",
+                        color="red", fontsize=8, ha="left", va="top", rotation=90)
+
+        ax.legend()
+        plt.tight_layout()
+        step_output = output_path.with_name(f"{output_path.stem}_step{step_idx}{output_path.suffix}")
+        plt.savefig(step_output, dpi=150)
+        plt.close(fig)
+        print(f"Saved plot to {step_output}")
 
 
 if __name__ == "__main__":

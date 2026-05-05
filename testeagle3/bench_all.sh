@@ -11,7 +11,8 @@ if [[ "${1:-}" == "--base" ]]; then
 fi
 
 BENCHES=(
-  mmlu mmlu_pro agieval_en commonsense_qa winogrande bbh
+  mmlu mmlu_pro 
+  agieval_en commonsense_qa winogrande bbh
   arc_challenge trivia_qa squad quac boolq drop
   mmlu_cot gpqa ifeval humaneval mbpp_plus gsm8k math
   apibank bfcl gorilla nexus

@@ -90,9 +90,11 @@ def main():
 
     colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2", "#937860", "#DA8BC3", "#8C8C8C", "#CCB974"]
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    oom_vlines = []
-
+    # Precompute per-model data and OOM positions
+    model_lines = {}
+    model_order = []
+    oom_entries = []
+    global_ymax = 0.0
     for i, f in enumerate(spec_files):
         data = load_jsonl(f)
         model_label = label_from_file(f)
@@ -104,37 +106,62 @@ def main():
             if c in ratios:
                 plot_x.append(j)
                 plot_y.append(ratios[c])
+        model_lines[model_label] = (plot_x, plot_y, color)
+        model_order.append(model_label)
+        if plot_y:
+            global_ymax = max(global_ymax, max(plot_y))
 
-        ax.plot(plot_x, plot_y, marker="o", label=model_label, color=color, linewidth=2)
-        # Track where model fully OOMs for vertical line
         full_oom_cats = [c for c in categories if oom_counts.get(c, 0) > 0 and c not in ratios]
         if full_oom_cats:
-            first_full_oom_idx = categories.index(full_oom_cats[0])
-            oom_vlines.append((5, model_label, color))
+            oom_entries.append((5, model_label, color))
 
-    ax.set_xlabel("Prompt Length")
-    ax.set_ylabel("Target to Draft Ratio")
-    ax.set_title("Runtime Ratio")
-    ax.set_xticks(x)
-    ax.set_xticklabels([CATEGORY_LABELS[c] for c in categories])
-    ax.legend()
-    ax.set_ylim(bottom=0)
-    ax.set_facecolor("#f5f5f5")
-    ax.grid(True, alpha=0.3)
+    # Frame contents per user order: eagle -> +OOM -> +smeargle
+    frames = [
+        {"models": {"Eagle"}, "oom": False},
+        {"models": {"Eagle"}, "oom": True},
+        {"models": {"Eagle", "Smeargle"}, "oom": True},
+    ]
 
-    # Draw OOM vertical lines after axis limits are set (one per x-position)
-    seen_oom_x = set()
-    for vline_x, label, color in oom_vlines:
-        if vline_x in seen_oom_x:
-            continue
-        seen_oom_x.add(vline_x)
-        ax.axvline(x=vline_x, color="red", linestyle=":", linewidth=1.5)
-        ax.text(vline_x + 0.05, ax.get_ylim()[1] * 0.95, f"{label} OOM",
-                color="red", fontsize=8, ha="left", va="top", rotation=90)
+    ylim_top = 1.0
+    output_path = Path(args.output)
 
-    plt.tight_layout()
-    plt.savefig(args.output, dpi=150)
-    print(f"Saved plot to {args.output}")
+    for step_idx, frame in enumerate(frames, start=1):
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+        for model_label in model_order:
+            plot_x, plot_y, color = model_lines[model_label]
+            if model_label in frame["models"]:
+                ax.plot(plot_x, plot_y, marker="o", label=model_label, color=color, linewidth=2)
+            else:
+                # Placeholder so legend stays identical across frames
+                ax.plot([], [], marker="o", label=model_label, color=color, linewidth=2)
+
+        ax.set_xlabel("Prompt Length")
+        ax.set_ylabel("Target to Draft Ratio")
+        ax.set_title("Runtime Ratio")
+        ax.set_xticks(x)
+        ax.set_xticklabels([CATEGORY_LABELS[c] for c in categories])
+        ax.set_xlim(-0.5, len(categories) - 0.5)
+        ax.set_ylim(0, ylim_top)
+        ax.set_facecolor("#f5f5f5")
+        ax.grid(True, alpha=0.3)
+
+        if frame["oom"]:
+            seen_oom_x = set()
+            for vline_x, label, color in oom_entries:
+                if vline_x in seen_oom_x:
+                    continue
+                seen_oom_x.add(vline_x)
+                ax.axvline(x=vline_x, color="red", linestyle=":", linewidth=1.5)
+                ax.text(vline_x + 0.05, ylim_top * 0.95, f"{label} OOM",
+                        color="red", fontsize=8, ha="left", va="top", rotation=90)
+
+        ax.legend(loc="upper left")
+        plt.tight_layout()
+        step_output = output_path.with_name(f"{output_path.stem}_step{step_idx}{output_path.suffix}")
+        plt.savefig(step_output, dpi=150)
+        plt.close(fig)
+        print(f"Saved plot to {step_output}")
 
 
 if __name__ == "__main__":

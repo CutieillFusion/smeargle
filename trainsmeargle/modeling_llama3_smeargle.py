@@ -48,7 +48,7 @@ class Mamba2(nn.Module):
         mamba2_config = Mamba2Config(
             hidden_size=target_config.hidden_size * 2,
             num_heads=target_config.num_attention_heads * 2,
-            head_dim=(target_config.hidden_size * 2) // target_config.num_attention_heads,
+            head_dim=(target_config.hidden_size) // target_config.num_attention_heads,
             state_size=draft_config.state_size,
             expand=draft_config.expand,
             conv_kernel=draft_config.conv_kernel,

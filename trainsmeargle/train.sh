@@ -4,7 +4,7 @@
 #SBATCH --error=models/%j/train_smeargle.err
 #SBATCH --partition=dgxh100
 #SBATCH --time=14-00:00:00
-#SBATCH --gres=gpu:7
+#SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=600G
 #SBATCH --account=undergrad_research

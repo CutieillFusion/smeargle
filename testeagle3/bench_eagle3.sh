@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=EAGLE3_BENCH
-#SBATCH --output=bench_eagle3_%x_%j.out
-#SBATCH --error=bench_eagle3_%x_%j.err
+#SBATCH --output=logs/bench_eagle3_%x_%j.out
+#SBATCH --error=logs/bench_eagle3_%x_%j.err
 #SBATCH --partition=dgxh100
-#SBATCH --time=72:00:00
+#SBATCH --time=24:00:00
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=300G
 #SBATCH --account=undergrad_research
 
@@ -50,6 +50,8 @@ if [[ "$USE_CHAT_TEMPLATE" == "false" ]]; then
 fi
 
 cd /data/ai_club/smeargle/testeagle3
+
+source ./_wait_for_bench_slot.sh
 
 singularity exec --nv \
   --bind /data/ai_club/smeargle/testeagle3:/workspace \

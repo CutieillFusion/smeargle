@@ -222,17 +222,16 @@ class LogSoftmaxLoss(torch.autograd.Function):
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
         )
-        n_valid = position_mask_flat.sum().float().clamp(min=1)
         ctx.save_for_backward(
-            logits.detach(), target, position_mask, m, d, tm, td, n_valid
+            logits.detach(), target, position_mask, m, d, tm, td
         )
-        return loss.sum() / n_valid
+        return loss.squeeze(1).mean()
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits, target, position_mask, m, d, tm, td, n_valid = ctx.saved_tensors
+        logits, target, position_mask, m, d, tm, td = ctx.saved_tensors
         B, T, V = logits.shape
-        scaling_factor = 1.0 / n_valid.item()
+        scaling_factor = 1.0 / (B * T)
         logits = logits.contiguous().view(B * T, V)
         target = target.contiguous().view(B * T, V)
         position_mask = position_mask.contiguous().view(B * T, 1).bool()

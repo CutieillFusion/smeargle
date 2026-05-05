@@ -32,8 +32,8 @@ singularity exec --nv \
     .venv/bin/torchrun --nproc_per_node=$NUM_GPUS --master_port=29000 main.py \
       --tp_size $TP_SIZE \
       --basepath /models/llama_3_1_8b_instruct \
-      --trainpath /datasets/train_5k.jsonl \
-      --testpath /datasets/test_5k.jsonl \
-      --epochs 1 \
+      --trainpath /datasets/perfect_blend/train_regen.jsonl \
+      --testpath /datasets/perfect_blend/test_regen.jsonl \
+      --epochs 10 \
       --savedir $SAVEDIR
   "
