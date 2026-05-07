@@ -34,11 +34,11 @@ from transformers.activations import ACT2FN
 from huggingface_hub import hf_hub_download
 
 try:
-    from .configs import EagleConfig
+    from .configs import EConfig
     from .utils_c import *
     from .choices import *
 except:
-    from configs import EagleConfig
+    from configs import EConfig
     from utils_c import *
     from choices import *
     from utils import prepare_logits_processor
@@ -289,10 +289,8 @@ class LlamaAttention(nn.Module):
                     self.head_dim, max_position_embeddings=self.max_position_embeddings
                 )
         else:
-            scaling_type = self.config.rope_scaling.get(
-                "type", self.config.rope_scaling.get("rope_type")
-            )
-            scaling_factor = self.config.rope_scaling.get("factor")
+            scaling_type = self.config.rope_scaling["type"]
+            scaling_factor = self.config.rope_scaling["factor"]
             if scaling_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim,
@@ -306,12 +304,7 @@ class LlamaAttention(nn.Module):
                     scaling_factor=scaling_factor,
                 )
             else:
-                base = getattr(self.config, "rope_theta", 10000)
-                self.rotary_emb = LlamaRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=base,
-                )
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return (
@@ -581,8 +574,7 @@ def len_list(x, n):
 class Model(nn.Module):
     def __init__(
         self,
-        draft_config,
-        target_config,
+        config,
         path=None,
         bias=True,
         total_tokens=63,
@@ -592,20 +584,17 @@ class Model(nn.Module):
         draft_kv_window=None,
     ):
         super().__init__()
-        self.draft_config = draft_config
-        self.target_config = target_config
+        self.config = config
         self.draft_kv_window = draft_kv_window
         self.gradient_checkpointing = True
-        self.padding_idx = target_config.pad_token_id
-        self.vocab_size = target_config.vocab_size
-        self.draft_vocab_size = draft_config.draft_vocab_size
-        self.hidden_size = target_config.hidden_size
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(
-            target_config.vocab_size, target_config.hidden_size, self.padding_idx
+            config.vocab_size, config.hidden_size, self.padding_idx
         )
         self.lm_head = nn.Linear(
-            target_config.hidden_size, draft_config.draft_vocab_size, bias=False
+            config.hidden_size, config.draft_vocab_size, bias=False
         )
 
         try:
@@ -652,18 +641,26 @@ class Model(nn.Module):
         self.total_tokens = total_tokens - 1
         self.depth = depth
         self.threshold = math.log(threshold)
-        self.midlayer = LlamaDecoderLayeremb(target_config)
-        self.fc = nn.Linear(target_config.hidden_size * 3, self.hidden_size, bias=False)
-        self.norm = LlamaRMSNorm(target_config.hidden_size, eps=target_config.rms_norm_eps)
+        self.hidden_size = config.hidden_size
+        self.midlayer = LlamaDecoderLayeremb(config)
+        if hasattr(config, "target_hidden_size"):
+            self.fc = nn.Linear(
+                config.target_hidden_size * 3, self.hidden_size, bias=False
+            )
+        else:
+            self.fc = nn.Linear(config.hidden_size * 3, self.hidden_size, bias=False)
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.logsoftmax = nn.LogSoftmax(dim=-1)
 
-        d2t = torch.zeros((draft_config.draft_vocab_size), dtype=torch.long)
-        t2d = torch.zeros((target_config.vocab_size), dtype=torch.bool)
+        d2t = torch.zeros((config.draft_vocab_size), dtype=torch.long)
+        t2d = torch.zeros((config.vocab_size), dtype=torch.bool)
         self.register_buffer("d2t", d2t)
         self.register_buffer("t2d", t2d)
 
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
+        
+        # print(count_parameters(self))
 
     def init_tree(self):
         self.tree_mask_init = torch.eye(
@@ -872,7 +869,7 @@ class Model(nn.Module):
         scores = topk_p[0]
         scores_list.append(scores[None])
         parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
-        if self.vocab_size == self.draft_vocab_size:
+        if self.config.vocab_size == self.config.draft_vocab_size:
             ss_token.append(topk_index)
             input_ids = topk_index
         else:
@@ -927,7 +924,7 @@ class Model(nn.Module):
 
             input_ids = topk_index.view(-1)[topk_cs_index][None]
 
-            if self.vocab_size == self.draft_vocab_size:
+            if self.config.vocab_size == self.config.draft_vocab_size:
                 ss_token.append(topk_index)
             else:
                 input_ids = input_ids + self.d2t[input_ids]
@@ -1021,5 +1018,6 @@ def count_parameters(model):
 
 
 if __name__ == "__main__":
-    config = EagleConfig.from_json("config.json")
-    print(config.__dict__)
+    config = EConfig.from_pretrained("config.json")
+    model = Model(config, load_emb=False)
+    print(model)

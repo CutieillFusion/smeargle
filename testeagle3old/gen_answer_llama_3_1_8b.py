@@ -1,11 +1,15 @@
-import matplotlib.pyplot as plt
 import argparse
 import json
+import os
 import subprocess
 import threading
-import time
-import os
+from accelerate.utils import set_seed
+
+set_seed(0)
+
+import matplotlib.pyplot as plt
 import numpy as np
+import time
 import shortuuid
 import torch
 
@@ -54,15 +58,14 @@ class PowerMonitor:
         return energy
 from fastchat.llm_judge.common import load_questions
 from tqdm import tqdm
-from model.smeargle_model import SmeargleModel
+import scipy.stats as stats
+from model.eagle_model import EagleModel
 from model.utils import prepare_logits_processor
-from accelerate.utils import set_seed
 
-set_seed(0)
 
 def run_eval(
     base_model_path: str,
-    smeargle_model_path: str,
+    eagle3_model_path: str,
     model_id: str,
     question_file: str,
     question_begin: int,
@@ -72,35 +75,38 @@ def run_eval(
     num_choices: int,
     num_gpus_per_model: int,
     num_gpus_total: int,
+    max_gpu_memory: str,
     temperature: float,
     total_token: int,
     depth: int,
     top_k: int,
     warmup_steps: int,
-    use_smeargle: bool,
+    use_eagle3: bool,
+    draft_kv_window: int = None,
 ):
     questions = load_questions(question_file, question_begin, question_end)
 
     assert num_gpus_total % num_gpus_per_model == 0
 
     chunk_size = len(questions) // (num_gpus_total // num_gpus_per_model)
-    
     [
         get_model_answers(
             base_model_path,
-            smeargle_model_path,
+            eagle3_model_path,
             total_token,
             depth,
             top_k,
             warmup_steps,
-            use_smeargle,
+            use_eagle3,
             questions[i : i + chunk_size],
             answer_file,
             max_new_token,
             num_choices,
             num_gpus_per_model,
+            max_gpu_memory,
             model_id,
             temperature,
+            draft_kv_window=draft_kv_window,
         )
         for i in range(0, len(questions), chunk_size)
     ]
@@ -109,38 +115,46 @@ def run_eval(
 @torch.inference_mode()
 def get_model_answers(
     base_model_path: str,
-    smeargle_model_path: str,
+    eagle3_model_path: str,
     total_token: int,
     depth: int,
     top_k: int,
     warmup_steps: int,
-    use_smeargle: bool,
+    use_eagle3: bool,
     questions: list[dict],
     answer_file: str,
     max_new_token: int,
     num_choices: int,
     num_gpus_per_model: int,
+    max_gpu_memory: str,
     model_id: str,
     temperature: float,
+    draft_kv_window: int = None,
 ):
-    model = SmeargleModel.from_pretrained(
+
+    model = EagleModel.from_pretrained(
         base_model_path=base_model_path,
-        smeargle_model_path=smeargle_model_path,
+        eagle_model_path=eagle3_model_path,
         total_token=total_token,
         depth=depth,
         top_k=top_k,
+        draft_kv_window=draft_kv_window,
         dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map="auto",
         attn_implementation="flash_attention_2",
     )
+
     tokenizer = model.get_tokenizer()
 
-    logits_processor = prepare_logits_processor(temperature=temperature) if temperature > 1e-5 else None
+    if temperature > 1e-5:
+        logits_processor = prepare_logits_processor(temperature=temperature)
+    else:
+        logits_processor = None
 
     model.eval()
 
-    generate = model.smearglegenerate if use_smeargle else model.naivegenerate
+    generate = model.eaglegenerate if use_eagle3 else model.naivegenerate
 
     warmup_question = questions[0]
     for _ in range(warmup_steps):
@@ -164,9 +178,11 @@ def get_model_answers(
                 [prompt],
                 add_special_tokens=False,
             ).input_ids
-            output_ids = generate(
+            output_ids, new_token, idx, accept_length, *_ = generate(
                 torch.as_tensor(input_ids).cuda(),
                 temperature=temperature,
+                log=True,
+                is_llama3=True,
             )
             torch.cuda.synchronize()
             output_ids = output_ids[0][len(input_ids[0]) :]
@@ -199,9 +215,7 @@ def get_model_answers(
             output = output.strip()
 
             messages.append({"role": "assistant", "content": output})
-    
-    if warmup_steps > 0:
-        print("Warmup done")
+    print("Warmup done")
 
     global_acceptance_lengths = [0.0 for _ in range(depth + 2)]
 
@@ -233,6 +247,11 @@ def get_model_answers(
                     add_generation_prompt=True,
                 )
 
+                prompt = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
                 input_ids = tokenizer(
                     [prompt],
                     add_special_tokens=False,
@@ -249,6 +268,7 @@ def get_model_answers(
                         torch.as_tensor(input_ids).cuda(),
                         temperature=temperature,
                         log=True,
+                        is_llama3=True,
                     )
                 except torch.cuda.OutOfMemoryError:
                     power_monitor.stop()
@@ -261,10 +281,10 @@ def get_model_answers(
                 power_monitor.stop()
                 total_time = time.time() - start_time
 
-                if use_smeargle:
-                    output_ids, acceptance_lengths, target_model_time, draft_model_time, draft_peak_mem = result
+                if use_eagle3:
+                    output_ids, new_token, idx, accept_lengths, target_model_time, draft_model_time, draft_peak_mem = result
                 else:
-                    output_ids, acceptance_lengths = result
+                    output_ids, new_token, idx, accept_lengths = result
                     target_model_time, draft_model_time = total_time, 0.0
                     draft_peak_mem = 0
 
@@ -299,8 +319,8 @@ def get_model_answers(
                 output = output.strip()
 
                 turns.append(output)
-                idxs.append(len(input_ids[0]))
-                new_tokens.append(len(output_ids))
+                idxs.append(int(idx))
+                new_tokens.append(int(new_token))
                 wall_time.append(total_time)
                 target_times.append(target_model_time)
                 draft_times.append(draft_model_time)
@@ -312,17 +332,17 @@ def get_model_answers(
             if skipped:
                 break
 
-            if use_smeargle:
+            if use_eagle3:
                 # Convert accept_lengths to CPU integers for processing
-                accept_lengths_int = [int(al) if hasattr(al, 'item') else int(al) for al in acceptance_lengths]
-
+                accept_lengths_int = [int(al) if hasattr(al, 'item') else int(al) for al in accept_lengths]
+                
                 # DIAGNOSTIC LOGGING: Track acceptance per position more accurately
                 max_accept_len = max(accept_lengths_int) if accept_lengths_int else 0
                 accept_length_per_position = [0.0 for _ in range(max_accept_len)]
-
+                
                 # Count how many times each position was proposed (denominator)
                 proposals_per_position = [0.0 for _ in range(max_accept_len)]
-
+                
                 for al in accept_lengths_int:
                     # Each iteration proposes up to depth positions
                     for pos_idx in range(min(depth + 1, max_accept_len)):
@@ -330,7 +350,7 @@ def get_model_answers(
                     # Only positions up to accept_length were accepted
                     for pos_idx in range(al):
                         accept_length_per_position[pos_idx] += 1.0
-
+                
                 # # Diagnostic: Print detailed stats for first choice of each question
                 # if i == 0:
                 #     print(f"\n=== DIAGNOSTIC: Acceptance Stats for Question {question['question_id']} ===")
@@ -343,22 +363,22 @@ def get_model_answers(
                 #         accepted = accept_length_per_position[pos] if pos < len(accept_length_per_position) else 0
                 #         rate = accepted / proposed if proposed > 0 else 0
                 #         print(f"  Position {pos+1}: accepted={int(accepted)}, proposed={int(proposed)}, true_rate={rate:.3f}")
-
+                    
                 #     total_draft_time = sum(draft_times)
                 #     total_target_time = sum(target_times)
                 #     total_time = total_draft_time + total_target_time
-                #     print("smeargle draft ratio:", total_draft_time / total_time)
-                #     print("smeargle target ratio:", total_target_time / total_time)
-                #     print("smeargle draft peak memory:", max_draft_peak_mem / 1024 / 1024, "MB")
-                #     print("smeargle total energy:", total_energy_joules, "J")
+                #     print("eagle3 draft ratio:", total_draft_time / total_time)
+                #     print("eagle3 target ratio:", total_target_time / total_time)
+                #     print("eagle3 draft peak memory:", max_draft_peak_mem / 1024 / 1024, "MB")
+                #     print("eagle3 total energy:", total_energy_joules, "J")
                 #     print("=" * 60 + "\n")
-
+                
                 for al in accept_lengths_int:
                     global_acceptance_lengths[al] += 1.0
 
                 # print("global_acceptance_lengths:", global_acceptance_lengths)
 
-            if use_smeargle:
+            if use_eagle3:
                 choices.append({
                     "index": i,
                     "turns": turns,
@@ -410,11 +430,9 @@ def get_model_answers(
             }
             fout.write(json.dumps(ans_json) + "\n")
 
+
 def reorg_answer_file(answer_file):
     """Sort by question id and de-duplication"""
-    if not os.path.exists(answer_file):
-        return
-
     answers = {}
     with open(answer_file, "r") as fin:
         for l in fin:
@@ -430,7 +448,7 @@ def reorg_answer_file(answer_file):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--smeargle-model-path",
+        "--eagle3-model-path",
         type=str,
         required=True,
         help="The path to the weights. This can be a local folder or a Hugging Face repo ID.",
@@ -504,6 +522,11 @@ if __name__ == "__main__":
         help="The number of warmup steps.",
     )
     parser.add_argument(
+        "--max-gpu-memory",
+        type=str,
+        help="Maxmum GPU memory used for model weights per GPU.",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.0,
@@ -513,19 +536,25 @@ if __name__ == "__main__":
         type=str,
         default="mc_sim_7b_63",
     )
-    parser.add_argument("--use-smeargle", action="store_true")
+    parser.add_argument("--use_eagle3", action="store_true")
+    parser.add_argument(
+        "--draft-kv-window",
+        type=int,
+        default=None,
+        help="Sliding window size for the draft model's KV cache. None means no window (default).",
+    )
 
     args = parser.parse_args()
 
     question_file = f"{args.benchmark_path}/question.jsonl"
 
-    model_id = f"{args.base_model_path.split('/')[-1]}_{'smeargle' if args.use_smeargle else 'baseline'}_temperature_{str(args.temperature).replace('.', '_')}_{args.benchmark_path.split('/')[-1]}"
+    model_id = f"{args.base_model_path.split('/')[-1]}_{'eagle3' if args.use_eagle3 else 'baseline'}_temperature_{str(args.temperature).replace('.', '_')}_{args.benchmark_path.split('/')[-1]}{f'_window_{args.draft_kv_window}' if args.draft_kv_window is not None else ''}"
 
     answer_file = f"{args.answer_file_path}/{model_id}.jsonl"
 
     run_eval(
         args.base_model_path,
-        args.smeargle_model_path,
+        args.eagle3_model_path,
         model_id,
         question_file,
         args.question_begin,
@@ -535,12 +564,14 @@ if __name__ == "__main__":
         args.num_choices,
         args.num_gpus_per_model,
         args.num_gpus_total,
+        args.max_gpu_memory,
         args.temperature,
         args.total_token,
         args.depth,
         args.top_k,
         args.warmup_steps,
-        args.use_smeargle,
+        args.use_eagle3,
+        draft_kv_window=args.draft_kv_window,
     )
 
     reorg_answer_file(answer_file)

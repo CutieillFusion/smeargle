@@ -58,7 +58,6 @@ class PowerMonitor:
         return energy
 from fastchat.llm_judge.common import load_questions
 from tqdm import tqdm
-import scipy.stats as stats
 from model.eagle_model import EagleModel
 from model.utils import prepare_logits_processor
 

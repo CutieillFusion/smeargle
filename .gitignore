@@ -30,6 +30,8 @@ datasets/*
 datasets/*/*
 !datasets/*/prepare.py
 !datasets/*/grade.py
+!datasets/wiki_long/question.jsonl
+!datasets/spec_bench/question.jsonl
 
 # Models
 models/*

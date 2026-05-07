@@ -47,13 +47,27 @@ except:
 class Mamba2(nn.Module):
     """MAMBA2 with cache support."""
 
-    def __init__(self, config):
+    def __init__(self, draft_config, target_config):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.residual_size
+        from transformers.models.mamba2.configuration_mamba2 import Mamba2Config as HFMamba2Config
+        mamba2_config = HFMamba2Config(
+            hidden_size=target_config.hidden_size * 2,
+            num_heads=target_config.num_attention_heads * 2,
+            head_dim=(target_config.hidden_size) // target_config.num_attention_heads,
+            state_size=draft_config.state_size,
+            expand=draft_config.expand,
+            conv_kernel=draft_config.conv_kernel,
+            n_groups=draft_config.n_groups,
+            chunk_size=draft_config.chunk_size,
+            num_hidden_layers=1,
+            residual_in_fp32=True,
+            layer_norm_epsilon=target_config.rms_norm_eps,
+        )
+        self.mamba2_config = mamba2_config
+        self.hidden_size = target_config.hidden_size
 
-        self.mamba2 = Mamba2Block(config, layer_idx=0)
-        self.out_proj = nn.Linear(config.hidden_size, config.residual_size, bias=False)
+        self.mamba2 = Mamba2Block(mamba2_config, layer_idx=0)
+        self.out_proj = nn.Linear(mamba2_config.hidden_size, target_config.hidden_size, bias=False)
 
     def forward(
         self,
@@ -79,7 +93,7 @@ class LlamaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.hidden_size = config.residual_size
+        self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
@@ -112,16 +126,16 @@ class LlamaRMSNorm(nn.Module):
 
 
 class SmeargleDecoderLayeremb(nn.Module):
-    def __init__(self, config):
+    def __init__(self, draft_config, target_config):
         super().__init__()
-        self.hidden_size = config.residual_size
-        self.mamba2 = Mamba2(config=config)
-        self.mlp = LlamaMLP(config)
-        self.hidden_norm = LlamaRMSNorm(config.residual_size, eps=config.rms_norm_eps)
-        self.input_layernorm = LlamaRMSNorm(config.residual_size, eps=config.rms_norm_eps)
+        self.hidden_size = target_config.hidden_size
+        self.mamba2 = Mamba2(draft_config, target_config)
+        self.mlp = LlamaMLP(target_config)
+        self.hidden_norm = LlamaRMSNorm(target_config.hidden_size, eps=target_config.rms_norm_eps)
+        self.input_layernorm = LlamaRMSNorm(target_config.hidden_size, eps=target_config.rms_norm_eps)
 
         self.post_attention_layernorm = LlamaRMSNorm(
-            config.residual_size, eps=config.rms_norm_eps
+            target_config.hidden_size, eps=target_config.rms_norm_eps
         )
 
     def forward(
@@ -212,7 +226,8 @@ def reindex_mamba_cache(cache, indices):
 class Model(nn.Module):
     def __init__(
         self,
-        config,
+        draft_config,
+        target_config,
         path=None,
         total_tokens=63,
         depth=5,
@@ -225,12 +240,13 @@ class Model(nn.Module):
         self.depth = depth
         self.top_k = top_k
         self.threshold = math.log(threshold)
-        self.hidden_size = config.residual_size
+        self.hidden_size = target_config.hidden_size
 
-        self.config = config
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-        self.draft_vocab_size = config.draft_vocab_size
+        self.draft_config = draft_config
+        self.target_config = target_config
+        self.padding_idx = target_config.pad_token_id
+        self.vocab_size = target_config.vocab_size
+        self.draft_vocab_size = draft_config.draft_vocab_size
 
         self.embed_tokens = nn.Embedding(
             self.vocab_size, self.hidden_size, self.padding_idx
@@ -239,7 +255,7 @@ class Model(nn.Module):
             self.hidden_size, self.draft_vocab_size, bias=False
         )
 
-        self.midlayer = SmeargleDecoderLayeremb(config)
+        self.midlayer = SmeargleDecoderLayeremb(draft_config, target_config)
 
         try:
             index_json_path = os.path.join(path, "model.safetensors.index.json")
@@ -285,7 +301,7 @@ class Model(nn.Module):
             param.requires_grad = False
 
         self.fc = nn.Linear(self.hidden_size * 3, self.hidden_size, bias=False)
-        self.norm = LlamaRMSNorm(self.hidden_size, eps=self.config.rms_norm_eps)
+        self.norm = LlamaRMSNorm(self.hidden_size, eps=target_config.rms_norm_eps)
         self.logsoftmax = nn.LogSoftmax(dim=-1)
 
         d2t = torch.zeros((self.draft_vocab_size), dtype=torch.long)
@@ -364,7 +380,7 @@ class Model(nn.Module):
                 )
         else:
             cache_params = Mamba2Cache(
-                self.config, batch_size=1,
+                self.midlayer.mamba2.mamba2_config, batch_size=1,
                 device=hidden_states.device, dtype=hidden_states.dtype,
             )
             cache_position = torch.arange(
@@ -394,7 +410,7 @@ class Model(nn.Module):
         scores = topk_p[0]
         scores_list.append(scores[None])
         parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
-        if self.config.vocab_size == self.config.draft_vocab_size:
+        if self.vocab_size == self.draft_vocab_size:
             ss_token.append(topk_index)
             input_ids = topk_index
         else:
@@ -458,7 +474,7 @@ class Model(nn.Module):
 
             input_ids = topk_index.view(-1)[topk_cs_index][:, None]  # [top_k, 1]
 
-            if self.config.vocab_size == self.config.draft_vocab_size:
+            if self.vocab_size == self.draft_vocab_size:
                 ss_token.append(topk_index)
             else:
                 input_ids = input_ids + self.d2t[input_ids]
@@ -550,6 +566,5 @@ def count_parameters(model):
 
 
 if __name__ == "__main__":
-    config = SmeargleConfig.from_pretrained("config.json")
-    model = Model(config)
-    print(model)
+    config = SmeargleConfig.from_json("config.json")
+    print(config.__dict__)

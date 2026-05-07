@@ -14,7 +14,7 @@ from .utils import *
 from .kv_cache import initialize_past_key_values
 
 from .cnets import Model
-from .configs import EagleConfig
+from .configs import EConfig
 
 
 class EagleModel(nn.Module):
@@ -40,11 +40,18 @@ class EagleModel(nn.Module):
             self.base_model_name_or_path, use_fast=False
         )
 
-        config = EagleConfig.from_json(eagle_model_path)
+        config = EConfig.from_pretrained(eagle_model_path)
+        with open(eagle_model_path, "r") as f:
+            con = json.loads(f.read())
+
+        try:
+            bias = con["bias"]
+        except:
+            bias = True
 
         self.eagle_layer = Model(
             config,
-            base_model.config,
+            bias=bias,
             total_tokens=total_token,
             depth=depth,
             top_k=top_k,
@@ -66,7 +73,7 @@ class EagleModel(nn.Module):
                 self.eagle_layer.layer_device = device
         else:
             self.eagle_layer.diff_device = False
-        if base_model.config.vocab_size == config.draft_vocab_size:
+        if config.vocab_size == config.draft_vocab_size:
             del self.eagle_layer.d2t, self.eagle_layer.t2d
 
         # Strip _orig_mod. prefix added by torch.compile() in training checkpoints
@@ -117,24 +124,20 @@ class EagleModel(nn.Module):
         if not os.path.exists(configpath):
             configpath = hf_hub_download(eagle_model_path, "config.json")
 
-        # Try loading draft model weights: .bin, .pt, then .safetensors
-        eagle_layer_state_dict = None
-        for filename in ["pytorch_model.bin", "draft_model.pt", "model.safetensors"]:
-            load_model_path = os.path.join(eagle_model_path, filename)
-            if os.path.exists(load_model_path):
-                if filename.endswith(".safetensors"):
-                    from safetensors.torch import load_file
-                    eagle_layer_state_dict = load_file(load_model_path)
-                else:
-                    eagle_layer_state_dict = torch.load(
-                        load_model_path, map_location=base_model.device
-                    )
-                break
-        if eagle_layer_state_dict is None:
-            raise FileNotFoundError(
-                f"No draft model weights found in {eagle_model_path}. "
-                "Expected pytorch_model.bin, draft_model.pt, or model.safetensors."
+        try:
+            load_model_path = os.path.join(eagle_model_path, "pytorch_model.bin")
+            if not os.path.exists(load_model_path):
+                load_model_path = hf_hub_download(eagle_model_path, "pytorch_model.bin")
+            eagle_layer_state_dict = torch.load(
+                load_model_path, map_location=base_model.device
             )
+        except:
+            from safetensors.torch import load_file
+
+            load_model_path = os.path.join(eagle_model_path, "model.safetensors")
+            if not os.path.exists(load_model_path):
+                load_model_path = hf_hub_download(eagle_model_path, "model.safetensors")
+            eagle_layer_state_dict = load_file(load_model_path)
 
         model = cls(
             base_model,
