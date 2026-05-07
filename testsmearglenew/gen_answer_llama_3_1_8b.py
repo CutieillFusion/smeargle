@@ -331,27 +331,27 @@ def get_model_answers(
                     for pos_idx in range(al):
                         accept_length_per_position[pos_idx] += 1.0
 
-                # Diagnostic: Print detailed stats for first choice of each question
-                if i == 0:
-                    print(f"\n=== DIAGNOSTIC: Acceptance Stats for Question {question['question_id']} ===")
-                    print(f"Total decoding iterations: {len(accept_lengths_int)}")
-                    print(f"Accept lengths distribution: {dict(zip(*np.unique(accept_lengths_int, return_counts=True)))}")
-                    print(f"Mean accept length: {np.mean(accept_lengths_int):.2f}")
-                    print(f"\nPer-position stats (true rate = accepted/proposed at each position):")
-                    for pos in range(min(8, max_accept_len)):  # Show first 8 positions
-                        proposed = proposals_per_position[pos] if pos < len(proposals_per_position) else 0
-                        accepted = accept_length_per_position[pos] if pos < len(accept_length_per_position) else 0
-                        rate = accepted / proposed if proposed > 0 else 0
-                        print(f"  Position {pos+1}: accepted={int(accepted)}, proposed={int(proposed)}, true_rate={rate:.3f}")
+                # # Diagnostic: Print detailed stats for first choice of each question
+                # if i == 0:
+                #     print(f"\n=== DIAGNOSTIC: Acceptance Stats for Question {question['question_id']} ===")
+                #     print(f"Total decoding iterations: {len(accept_lengths_int)}")
+                #     print(f"Accept lengths distribution: {dict(zip(*np.unique(accept_lengths_int, return_counts=True)))}")
+                #     print(f"Mean accept length: {np.mean(accept_lengths_int):.2f}")
+                #     print(f"\nPer-position stats (true rate = accepted/proposed at each position):")
+                #     for pos in range(min(8, max_accept_len)):  # Show first 8 positions
+                #         proposed = proposals_per_position[pos] if pos < len(proposals_per_position) else 0
+                #         accepted = accept_length_per_position[pos] if pos < len(accept_length_per_position) else 0
+                #         rate = accepted / proposed if proposed > 0 else 0
+                #         print(f"  Position {pos+1}: accepted={int(accepted)}, proposed={int(proposed)}, true_rate={rate:.3f}")
 
-                    total_draft_time = sum(draft_times)
-                    total_target_time = sum(target_times)
-                    total_time = total_draft_time + total_target_time
-                    print("smeargle draft ratio:", total_draft_time / total_time)
-                    print("smeargle target ratio:", total_target_time / total_time)
-                    print("smeargle draft peak memory:", max_draft_peak_mem / 1024 / 1024, "MB")
-                    print("smeargle total energy:", total_energy_joules, "J")
-                    print("=" * 60 + "\n")
+                #     total_draft_time = sum(draft_times)
+                #     total_target_time = sum(target_times)
+                #     total_time = total_draft_time + total_target_time
+                #     print("smeargle draft ratio:", total_draft_time / total_time)
+                #     print("smeargle target ratio:", total_target_time / total_time)
+                #     print("smeargle draft peak memory:", max_draft_peak_mem / 1024 / 1024, "MB")
+                #     print("smeargle total energy:", total_energy_joules, "J")
+                #     print("=" * 60 + "\n")
 
                 for al in accept_lengths_int:
                     global_acceptance_lengths[al] += 1.0

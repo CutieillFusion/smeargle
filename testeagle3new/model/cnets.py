@@ -289,8 +289,10 @@ class LlamaAttention(nn.Module):
                     self.head_dim, max_position_embeddings=self.max_position_embeddings
                 )
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
+            scaling_type = self.config.rope_scaling.get(
+                "type", self.config.rope_scaling.get("rope_type")
+            )
+            scaling_factor = self.config.rope_scaling.get("factor")
             if scaling_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim,
@@ -304,7 +306,12 @@ class LlamaAttention(nn.Module):
                     scaling_factor=scaling_factor,
                 )
             else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+                base = getattr(self.config, "rope_theta", 10000)
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=base,
+                )
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return (

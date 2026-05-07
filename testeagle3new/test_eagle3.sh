@@ -25,7 +25,7 @@ singularity exec --nv \
     export LD_LIBRARY_PATH=\$CUDA_HOME/lib64:\$LD_LIBRARY_PATH && \
     uv sync && \
     .venv/bin/python gen_answer_llama_3_1_8b.py \
-      --eagle3-model-path /models/eagle3_3_1_8b_instruct_perfect_blend \
+      --eagle3-model-path /models/eagle3_neurips \
       --base-model-path /models/llama_3_1_8b_instruct \
       --answer-file-path /workspace \
       --benchmark-path /datasets/wiki_long \

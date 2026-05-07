@@ -25,10 +25,10 @@ singularity exec --nv \
     export LD_LIBRARY_PATH=\$CUDA_HOME/lib64:\$LD_LIBRARY_PATH && \
     uv sync && \
     .venv/bin/python gen_answer_llama_3_1_8b.py \
-      --smeargle-model-path /models/smeargle_3_1_8b_instruct_perfect_blend_new \
+      --smeargle-model-path /models/smeargle_neurips \
       --base-model-path /models/llama_3_1_8b_instruct \
       --answer-file-path /workspace \
-      --benchmark-path /datasets/wiki_long_test \
+      --benchmark-path /datasets/wiki_long \
       --temperature 0.0 \
       --depth 5 \
       --warmup-steps 3 \
